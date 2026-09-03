@@ -7,6 +7,11 @@ MIN_BUDGET_MS = 30
 ASSUMED_MOVES_LEFT = 30
 INCREMENT_MS = 500
 
+# Below this much clock, skip the tree search entirely (see search.quick_best_move). A depth-1
+# search can cascade through thousands of quiescence nodes on a tactical position before the
+# first in-search time check fires, and below ~100ms that alone can exceed what is left.
+PANIC_MS = 150
+
 
 def budget_ms(time_left_ms: int) -> int:
     """How long this move gets, out of the clock we were handed."""

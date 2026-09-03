@@ -6,11 +6,16 @@ that matter most at Python-scale node counts, per docs/IDEAS.md, and a TT is a s
 once this is proven correct and robust.
 
 Time safety: numba cannot call time.perf_counter() directly in nopython mode, so the search
-drops back to Python via `objmode` every 1024 nodes to check a wall-clock deadline. On abort it
+drops back to Python via `objmode` every 128 nodes to check a wall-clock deadline. On abort it
 propagates a sentinel up immediately rather than unwinding cleanly -- cheap because the check is
 frequent enough that the overrun past the deadline is small and bounded by remaining call depth.
 A root search that aborts before finishing is discarded entirely by the caller (timeman-driven
 iterative deepening in agent.py), never returned as a partial, possibly-misordered result.
+
+Below timeman.PANIC_MS remaining, agent.py skips the tree search altogether and plays
+quick_best_move instead: even a depth-1 search can cascade through thousands of quiescence
+nodes on a tactical position before the first check point, and at a few tens of milliseconds of
+clock left that alone can be enough to flag. quick_best_move never recurses, so it cannot.
 """
 
 import time
@@ -24,7 +29,7 @@ from movegen import generate_legal, is_check, make_move, piece_type_at
 
 MATE = 1_000_000
 INF = 2_000_000
-CHECK_INTERVAL = 1023
+CHECK_INTERVAL = 127
 QUIESCENCE_MAX_PLIES = 24
 ONE = np.uint64(1)
 
@@ -229,6 +234,28 @@ def search_root(
             alpha = best_score
 
     return best_from, best_to, best_promo, best_score, True
+
+
+@njit(cache=False)
+def quick_best_move(
+    bb: np.ndarray,
+    meta: np.ndarray,
+    from_arr: np.ndarray,
+    to_arr: np.ndarray,
+    promo_arr: np.ndarray,
+    count: int,
+) -> tuple[int, int, int]:
+    """The best-looking legal move by MVV-LVA/promotion score alone, no search. Never recurses,
+    so it has no way to overrun a deadline -- the fallback for when there is no time to search.
+    """
+    scores = _score_moves(bb, meta, from_arr, to_arr, promo_arr, count, -1, -1, -1)
+    best_idx = 0
+    best_score = scores[0]
+    for i in range(1, count):
+        if scores[i] > best_score:
+            best_score = scores[i]
+            best_idx = i
+    return from_arr[best_idx], to_arr[best_idx], promo_arr[best_idx]
 
 
 def new_counters() -> np.ndarray:
