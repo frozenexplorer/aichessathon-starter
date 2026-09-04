@@ -37,6 +37,55 @@ probe (-alpha-1, -alpha) and is only re-searched with the full window if that pr
 might actually beat alpha. Cuts the cost of nodes that ordering already got right, which the
 hash-move-first and killer/history ordering above make the common case.
 
+Aspiration windows: search_root's first pass at a given depth (depth > 2, and only once the
+previous depth's score is a real, non-mate value) searches a narrow window centered on the
+previous iterative-deepening depth's score rather than -INF..INF, on the premise that the score
+rarely swings far in one more ply. A fail-high or fail-low re-searches the same depth with the
+full window -- one extra pass in the rare case, never a correctness risk, since the final result
+is only ever accepted once it comes from a pass whose window did not clip it.
+
+Null-move pruning: at a non-leaf node deep enough (NULL_MOVE_MIN_DEPTH), negamax additionally
+tries giving the side to move a free pass (make_null_move: same board, turn flipped, en passant
+forfeited) and searching the rest at depth - 1 - NULL_MOVE_REDUCTION with a null window just above
+beta. If even a free move for the opponent is not enough to drop the score below beta, the real
+position is assumed to cut off too and the whole subtree is pruned. Two zugzwang guards, since a
+free move can look safe in a position where every real move only makes things worse: skipped
+while in check (the null move would leave an illegal, check-blind position), and skipped when the
+side to move has no non-pawn material left (has_non_pawn_material) -- exactly the king+pawn
+endgames zugzwang is common in, which is also the class of position DTZ was added to get right
+(see tablebase.py). `allow_null` additionally forbids two null moves in a row (a null move whose
+own child is itself another null-move probe proves nothing and just burns depth), threaded through
+every real-move recursive call as True and through the null-move probe's own call as False.
+
+Static exchange evaluation (see()): a real exchange calculation (least-valuable-attacker-first,
+swap-list algorithm) replaces MVV-LVA's rough capture-ordering heuristic in _move_score, and
+quiescence uses it to skip searching a capture outright once its SEE is negative -- a capture
+that loses material cannot help quiescing the position, and exploring it anyway was the direct
+cause of the 500K-2M+ node counts observed at depth 7-9 in sharp middlegames (see docs/STATUS.md).
+Ignores pins, same simplification essentially every engine's SEE makes -- see() is a heuristic for
+ordering and pruning, never a legality check, so a wrong answer there misorders or mis-prunes but
+cannot make the search return an illegal move.
+
+Late move reductions: inside negamax's move loop (never at the root -- search_root explores every
+root move at full depth), a quiet move late enough in the ordering (see LMR_MIN_MOVE_INDEX) gets
+searched one ply shallower first, on the premise that TT/killer/history ordering has already
+almost certainly put the moves worth full depth ahead of it. Only promotes to a full-depth
+re-search if the reduced probe still beats alpha, and from there falls into the same full-window
+PVS re-search as any other move that beats alpha -- so a reduction can only cost extra nodes
+re-confirming a move, never silently accept a wrong score, since the final accepted score for any
+move that raises alpha always comes from a full-depth search. Skipped entirely when the current
+node or the resulting position is in check, or the move is a capture or promotion -- exactly the
+tactical moves a shallower search is least equipped to judge.
+
+Search extensions: a move that gives check gets its child searched at the same depth rather than
+depth - 1 -- a full ply deeper than normal, since a forced reply to check is exactly the kind of
+forcing line a depth-limited search most needs the extra ply for. ext_budget bounds how many of
+these one line can stack (MAX_CHECK_EXTENSIONS), so a long forcing check sequence cannot inflate
+one line's effective depth arbitrarily at every other line's expense within the same time budget.
+Depth extends, never ply: the TT still stores against the exact depth value passed to that node,
+so a cached entry is always compared like-for-like regardless of how much extension went into
+reaching it, and the mate-distance adjustment (keyed on ply, not depth) is unaffected either way.
+
 Repetition, mechanism 1 -- our own turn recurring: negamax and search_root take a shared
 `history` array of zobrist hashes plus `hist_len`, the count of entries that precede the current
 node. Only our-turn positions (even ply, root = ply 0) are ever recorded or checked here -- the
@@ -76,9 +125,18 @@ import time
 import numpy as np
 from numba import njit, objmode
 
-from bitboard import PAWN, QUEEN
+from attacks import KING_ATTACKS, KNIGHT_ATTACKS, PAWN_ATTACKS, bishop_attacks, rook_attacks
+from bitboard import BISHOP, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE
 from evaluate import PIECE_VALUE, evaluate
-from movegen import generate_legal, is_check, make_move, piece_type_at
+from movegen import (
+    generate_legal,
+    has_non_pawn_material,
+    is_check,
+    make_move,
+    make_null_move,
+    occ_all,
+    piece_type_at,
+)
 from zobrist import position_hash
 
 MATE = 1_000_000
@@ -86,6 +144,42 @@ INF = 2_000_000
 CHECK_INTERVAL = 127
 QUIESCENCE_MAX_PLIES = 24
 ONE = np.uint64(1)
+
+# Aspiration windows: search_root centers the first pass's alpha-beta window on the previous
+# iterative-deepening depth's score instead of always searching -INF..INF, re-searching with the
+# full window on a fail-high/fail-low. NO_PREV_SCORE (a value no real score or mate score can ever
+# equal, since MATE < INF strictly) tells search_root there is no previous depth to center on --
+# used for depth 1 and whenever the prior score was itself outside the mate threshold.
+ASPIRATION_WINDOW = 50
+NO_PREV_SCORE = INF
+
+# Null-move pruning: give the side to move a free pass and search the rest at a reduced depth; if
+# that is still enough to cause a beta cutoff, the real move would only do better, so the whole
+# subtree is pruned. NULL_MOVE_MIN_DEPTH keeps depth - 1 - NULL_MOVE_REDUCTION non-negative (any
+# smaller and it degrades to a quiescence call anyway, not a useful probe) and NULL_MOVE_REDUCTION
+# is the standard R=2. Guarded against zugzwang two ways -- see negamax.
+NULL_MOVE_MIN_DEPTH = 3
+NULL_MOVE_REDUCTION = 2
+
+# Late move reductions: a quiet move searched late in the ordering (oi >= LMR_MIN_MOVE_INDEX,
+# after the hash/killer/history-backed moves have already had their full-depth say) gets one ply
+# less depth first; only a reduced-depth score that still beats alpha earns a full-depth
+# re-search before PVS's own full-window re-search gets a chance. Deliberately conservative (a
+# fixed one-ply reduction, not depth- or move-count-scaled) since this sits on top of the
+# existing TT/killer/history ordering rather than replacing it -- see docs/FUTURE.md item 5.
+LMR_MIN_DEPTH = 3
+LMR_MIN_MOVE_INDEX = 3
+LMR_REDUCTION = 1
+
+# Search extensions: a move that gives check gets its child searched a full ply deep (depth is
+# not decremented) instead of the usual depth - 1, since a forced reply to check is exactly the
+# kind of forcing, tactically-critical line a depth-limited search is otherwise most likely to
+# misjudge. ext_budget, threaded through negamax and decremented once per extension granted,
+# caps how many of these a single line can stack -- unbounded stacking (e.g. a long forcing check
+# sequence) would let one line's effective depth grow arbitrarily, at the expense of every
+# sibling line sharing the same time budget. MAX_CHECK_EXTENSIONS is deliberately small: enough
+# for a real forcing sequence, far short of enough to meaningfully skew the time budget.
+MAX_CHECK_EXTENSIONS = 8
 
 # Our-turn positions per game are bounded by rules.PLY_CAP / 2 (~150); in-search growth is
 # bounded by MAX_DEPTH / 2 (agent.py caps depth at 64, so ~32 more). 512 leaves ample headroom.
@@ -128,6 +222,114 @@ def is_capture(bb: np.ndarray, meta: np.ndarray, from_sq: int, to_sq: int) -> bo
     return False
 
 
+# Exchange chains are bounded by total pieces on the board (32), so 32 gain-array slots is
+# ample headroom -- see() never appends past one entry per capture in the chain.
+SEE_MAX_DEPTH = 32
+
+
+@njit(cache=False)
+def _bit_scan(bits: np.uint64) -> int:
+    for square in range(64):
+        if bits & (ONE << np.uint64(square)):
+            return square
+    return -1
+
+
+@njit(cache=False)
+def _see_least_valuable_attacker(
+    bb: np.ndarray, occ: np.uint64, color: int, square: int
+) -> tuple[int, int]:
+    """The lowest-value piece of `color` attacking `square` given `occ`, as (from_square,
+    piece_type), or (-1, -1) if none. Sliding attacks are recomputed against the live `occ` on
+    every call rather than tracked incrementally, which is what makes discovered ("x-ray")
+    attackers fall out for free as pieces are removed during the exchange in see() below -- once
+    a blocker is cleared from `occ`, bishop_attacks/rook_attacks simply see past it on the next
+    call. Same ray-cast-over-magic-bitboards tradeoff as the rest of attacks.py.
+    """
+    attackers = PAWN_ATTACKS[1 - color, square] & bb[color * 6 + PAWN]
+    if attackers:
+        return _bit_scan(attackers), PAWN
+    attackers = KNIGHT_ATTACKS[square] & bb[color * 6 + KNIGHT]
+    if attackers:
+        return _bit_scan(attackers), KNIGHT
+    attackers = bishop_attacks(square, occ) & bb[color * 6 + BISHOP]
+    if attackers:
+        return _bit_scan(attackers), BISHOP
+    attackers = rook_attacks(square, occ) & bb[color * 6 + ROOK]
+    if attackers:
+        return _bit_scan(attackers), ROOK
+    attackers = (bishop_attacks(square, occ) | rook_attacks(square, occ)) & bb[color * 6 + QUEEN]
+    if attackers:
+        return _bit_scan(attackers), QUEEN
+    attackers = KING_ATTACKS[square] & bb[color * 6 + KING]
+    if attackers:
+        return _bit_scan(attackers), KING
+    return -1, -1
+
+
+@njit(cache=False)
+def see(bb: np.ndarray, meta: np.ndarray, from_sq: int, to_sq: int, promo: int) -> int:
+    """Static exchange evaluation of playing (from_sq, to_sq, promo): the net material change on
+    `to_sq` after both sides recapture there optimally (least-valuable-attacker first), not just
+    the value of what this one move immediately wins. Standard swap-list algorithm (see
+    chessprogramming.org "SEE - The Swap Algorithm"): gain[d] is what the side capturing at ply d
+    nets (what they take, minus the previous ply's gain from their opponent's perspective), and
+    the final backward min-max pass lets either side stop the exchange early if continuing it
+    would lose more than declining to.
+
+    Ignores pins and check-legality of intermediate recaptures (a standard SEE simplification --
+    it can misjudge a recapture that is actually illegal because the recapturing piece is pinned),
+    which is why this is a move-ordering and quiescence-pruning heuristic, never a legality check.
+    """
+    color = meta[0]
+    opponent = 1 - color
+    moving_pt = piece_type_at(bb, color, from_sq)
+    ep_square = meta[5]
+    is_ep = moving_pt == PAWN and to_sq == ep_square and (from_sq % 8) != (to_sq % 8)
+    victim_pt = PAWN if is_ep else piece_type_at(bb, opponent, to_sq)
+
+    gain = np.zeros(SEE_MAX_DEPTH, dtype=np.int64)
+    gain[0] = PIECE_VALUE[victim_pt] if victim_pt >= 0 else 0
+    if promo >= 0:
+        gain[0] += PIECE_VALUE[promo] - PIECE_VALUE[PAWN]
+
+    work = bb.copy()
+    if is_ep:
+        captured_sq = to_sq - 8 if color == WHITE else to_sq + 8
+        work[opponent * 6 + PAWN] &= ~(ONE << np.uint64(captured_sq))
+    elif victim_pt >= 0:
+        work[opponent * 6 + victim_pt] &= ~(ONE << np.uint64(to_sq))
+    work[color * 6 + moving_pt] &= ~(ONE << np.uint64(from_sq))
+    on_square_pt = promo if (moving_pt == PAWN and promo >= 0) else moving_pt
+    work[color * 6 + on_square_pt] |= ONE << np.uint64(to_sq)
+    on_square_value = PIECE_VALUE[on_square_pt]
+
+    side = opponent
+    depth = 0
+    while depth < SEE_MAX_DEPTH - 1:
+        occ = occ_all(work)
+        atk_sq, atk_pt = _see_least_valuable_attacker(work, occ, side, to_sq)
+        if atk_sq < 0:
+            break
+        depth += 1
+        gain[depth] = on_square_value - gain[depth - 1]
+
+        work[(1 - side) * 6 + on_square_pt] &= ~(ONE << np.uint64(to_sq))
+        work[side * 6 + atk_pt] &= ~(ONE << np.uint64(atk_sq))
+        promotes = atk_pt == PAWN and (
+            (side == WHITE and to_sq >= 56) or (side != WHITE and to_sq <= 7)
+        )
+        on_square_pt = QUEEN if promotes else atk_pt
+        work[side * 6 + on_square_pt] |= ONE << np.uint64(to_sq)
+        on_square_value = PIECE_VALUE[on_square_pt]
+        side = 1 - side
+
+    while depth > 0:
+        gain[depth - 1] = -max(-gain[depth - 1], gain[depth])
+        depth -= 1
+    return int(gain[0])
+
+
 @njit(cache=False)
 def _move_score(
     bb: np.ndarray,
@@ -148,12 +350,9 @@ def _move_score(
 
     opponent = 1 - meta[0]
     victim_pt = piece_type_at(bb, opponent, to_sq)
-    if victim_pt >= 0:
-        attacker_pt = piece_type_at(bb, meta[0], from_sq)
-        score += 10_000 + PIECE_VALUE[victim_pt] * 10 - PIECE_VALUE[attacker_pt]
-    elif to_sq == meta[5] and piece_type_at(bb, meta[0], from_sq) == PAWN:
-        if (from_sq % 8) != (to_sq % 8):
-            score += 10_000 + PIECE_VALUE[PAWN] * 10 - PIECE_VALUE[PAWN]
+    is_ep = to_sq == meta[5] and piece_type_at(bb, meta[0], from_sq) == PAWN
+    if victim_pt >= 0 or (is_ep and (from_sq % 8) != (to_sq % 8)):
+        score += 10_000 + see(bb, meta, from_sq, to_sq, promo)
     return score
 
 
@@ -245,12 +444,12 @@ def quiescence(
     if qdepth <= 0:
         return alpha
 
-    scores = np.full(count, -1, dtype=np.int64)
+    scores = np.full(count, -INF, dtype=np.int64)
     ncap = 0
     for i in range(count):
         f, t, p = from_arr[i], to_arr[i], promo_arr[i]
         if is_capture(bb, meta, f, t) or p == QUEEN:
-            scores[i] = _move_score(bb, meta, f, t, p, -1, -1, -1)
+            scores[i] = see(bb, meta, f, t, p)
             ncap += 1
     if ncap == 0:
         return alpha
@@ -258,6 +457,11 @@ def quiescence(
     order = np.argsort(-scores)
     for oi in range(ncap):
         idx = order[oi]
+        if scores[idx] < 0:
+            # SEE-descending order: everything from here on is at least as losing. A capture
+            # that loses material outright cannot help quiescing the position, so skip searching
+            # it rather than exploring it -- see docs/FUTURE.md item 4.
+            break
         f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
         new_bb, new_meta = make_move(bb, meta, f, t, p)
         score = -quiescence(new_bb, new_meta, -beta, -alpha, deadline, counters, qdepth - 1)
@@ -293,6 +497,8 @@ def negamax(
     killer_to: np.ndarray,
     killer_promo: np.ndarray,
     history_table: np.ndarray,
+    allow_null: bool,
+    ext_budget: int,
 ) -> int:
     counters[0] += 1
     if _time_up(deadline, counters):
@@ -344,6 +550,27 @@ def negamax(
     if depth <= 0:
         return quiescence(bb, meta, alpha, beta, deadline, counters, QUIESCENCE_MAX_PLIES)
 
+    in_check = is_check(bb, meta)
+
+    if (
+        allow_null
+        and depth >= NULL_MOVE_MIN_DEPTH
+        and -MATE_STORE_THRESHOLD < beta < MATE_STORE_THRESHOLD
+        and not in_check
+        and has_non_pawn_material(bb, meta[0])
+    ):
+        null_meta = make_null_move(meta)
+        null_score = -negamax(
+            bb, null_meta, depth - 1 - NULL_MOVE_REDUCTION, -beta, -beta + 1, deadline, counters,
+            ply + 1, history, child_hist_len,
+            tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
+            killer_from, killer_to, killer_promo, history_table, False, ext_budget,
+        )
+        if counters[1]:
+            return 0
+        if null_score >= beta:
+            return beta
+
     k1_from = int(killer_from[ply, 0])
     k1_to, k1_promo = int(killer_to[ply, 0]), int(killer_promo[ply, 0])
     k2_from = int(killer_from[ply, 1])
@@ -362,26 +589,55 @@ def negamax(
         idx = order[oi]
         f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
         new_bb, new_meta = make_move(bb, meta, f, t, p)
+        gives_check = is_check(new_bb, new_meta)
+        if ext_budget > 0 and gives_check:
+            child_depth = depth
+            child_ext_budget = ext_budget - 1
+        else:
+            child_depth = depth - 1
+            child_ext_budget = ext_budget
+
         if oi == 0:
             score = -negamax(
-                new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters,
+                new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters,
                 ply + 1, history, child_hist_len,
                 tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                killer_from, killer_to, killer_promo, history_table,
+                killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
             )
         else:
+            reduction = 0
+            if (
+                oi >= LMR_MIN_MOVE_INDEX
+                and depth >= LMR_MIN_DEPTH
+                and p < 0
+                and not in_check
+                and not is_capture(bb, meta, f, t)
+                and not gives_check
+            ):
+                reduction = LMR_REDUCTION
+
             score = -negamax(
-                new_bb, new_meta, depth - 1, -alpha - 1, -alpha, deadline, counters,
+                new_bb, new_meta, child_depth - reduction, -alpha - 1, -alpha, deadline, counters,
                 ply + 1, history, child_hist_len,
                 tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                killer_from, killer_to, killer_promo, history_table,
+                killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
             )
-            if not counters[1] and alpha < score < beta:
+            if not counters[1] and reduction > 0 and score > alpha:
+                # the reduced-depth probe suggested this late, quiet move might actually be
+                # good -- confirm at full depth (still null window) before trusting it enough
+                # to maybe trigger the full-window PVS re-search below.
                 score = -negamax(
-                    new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters,
+                    new_bb, new_meta, child_depth, -alpha - 1, -alpha, deadline, counters,
                     ply + 1, history, child_hist_len,
                     tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                    killer_from, killer_to, killer_promo, history_table,
+                    killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
+                )
+            if not counters[1] and alpha < score < beta:
+                score = -negamax(
+                    new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters,
+                    ply + 1, history, child_hist_len,
+                    tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
+                    killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
                 )
         if counters[1]:
             return 0
@@ -490,6 +746,85 @@ def claim_eligible_for_opponent(
 
 
 @njit(cache=False)
+def _search_root_pass(
+    bb: np.ndarray,
+    meta: np.ndarray,
+    depth: int,
+    alpha: int,
+    beta: int,
+    deadline: float,
+    counters: np.ndarray,
+    pv_from: int,
+    pv_to: int,
+    pv_promo: int,
+    history: np.ndarray,
+    hist_len: int,
+    opponent_history: np.ndarray,
+    opponent_hist_len: int,
+    tt_key: np.ndarray,
+    tt_depth: np.ndarray,
+    tt_score: np.ndarray,
+    tt_flag: np.ndarray,
+    tt_from: np.ndarray,
+    tt_to: np.ndarray,
+    tt_promo: np.ndarray,
+    killer_from: np.ndarray,
+    killer_to: np.ndarray,
+    killer_promo: np.ndarray,
+    history_table: np.ndarray,
+    from_arr: np.ndarray,
+    to_arr: np.ndarray,
+    promo_arr: np.ndarray,
+    order: np.ndarray,
+    count: int,
+) -> tuple[int, int, int, int, bool]:
+    """One root pass over already-ordered moves within a fixed [alpha, beta] window -- factored
+    out of search_root so aspiration windows (see there) can re-run this at the same depth with a
+    wider window on a fail-high/fail-low without re-ordering or re-generating moves.
+    """
+    best_score = -INF
+    best_from, best_to, best_promo = from_arr[order[0]], to_arr[order[0]], promo_arr[order[0]]
+
+    for oi in range(count):
+        idx = order[oi]
+        f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
+        new_bb, new_meta = make_move(bb, meta, f, t, p)
+        child_depth = depth if is_check(new_bb, new_meta) else depth - 1
+        child_ext_budget = MAX_CHECK_EXTENSIONS - (1 if child_depth == depth else 0)
+        if oi == 0:
+            score = -negamax(
+                new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters, 1, history,
+                hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
+                killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
+            )
+        else:
+            score = -negamax(
+                new_bb, new_meta, child_depth, -alpha - 1, -alpha, deadline, counters, 1, history,
+                hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
+                killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
+            )
+            if not counters[1] and alpha < score < beta:
+                score = -negamax(
+                    new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters, 1, history,
+                    hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
+                    killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
+                )
+        if counters[1]:
+            return best_from, best_to, best_promo, best_score, False
+        if claim_eligible_for_opponent(
+            new_bb, new_meta, history, hist_len, opponent_history, opponent_hist_len, 1
+        ):
+            score = min(score, 0)
+        if score > best_score:
+            best_score = score
+            best_from, best_to, best_promo = f, t, p
+        if best_score > alpha:
+            alpha = best_score
+
+    return best_from, best_to, best_promo, best_score, True
+
+
+@njit(cache=False)
 def search_root(
     bb: np.ndarray,
     meta: np.ndarray,
@@ -514,13 +849,16 @@ def search_root(
     killer_to: np.ndarray,
     killer_promo: np.ndarray,
     history_table: np.ndarray,
+    prev_score: int,
 ) -> tuple[int, int, int, int, bool]:
     """hist_len counts our-turn positions already recorded, including the root's own -- the
     caller (agent.py) writes history[hist_len - 1] = hash(bb, meta) before calling this, since it
     already needs that hash for the persistent cross-move history anyway. opponent_hist_len
     counts the real game's own past opponent-turn positions, one recorded per move we have
     actually played -- see claim_eligible_for_opponent. tt_* / killer_* / history_table are
-    threaded straight into negamax; see this module's docstring.
+    threaded straight into negamax; see this module's docstring. prev_score is the previous
+    iterative-deepening depth's score, or NO_PREV_SCORE if there isn't one (depth 1) -- used to
+    center the aspiration window (see module-level constants).
     """
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     if count == 0:
@@ -529,46 +867,26 @@ def search_root(
     scores = _score_moves(bb, meta, from_arr, to_arr, promo_arr, count, pv_from, pv_to, pv_promo)
     order = np.argsort(-scores)
 
-    alpha = -INF
-    beta = INF
-    best_score = -INF
-    best_from, best_to, best_promo = from_arr[order[0]], to_arr[order[0]], promo_arr[order[0]]
+    if depth <= 2 or prev_score == NO_PREV_SCORE or abs(prev_score) >= MATE_STORE_THRESHOLD:
+        alpha, beta = -INF, INF
+    else:
+        alpha = max(-INF, prev_score - ASPIRATION_WINDOW)
+        beta = min(INF, prev_score + ASPIRATION_WINDOW)
 
-    for oi in range(count):
-        idx = order[oi]
-        f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
-        new_bb, new_meta = make_move(bb, meta, f, t, p)
-        if oi == 0:
-            score = -negamax(
-                new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters, 1, history,
-                hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                killer_from, killer_to, killer_promo, history_table,
-            )
-        else:
-            score = -negamax(
-                new_bb, new_meta, depth - 1, -alpha - 1, -alpha, deadline, counters, 1, history,
-                hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                killer_from, killer_to, killer_promo, history_table,
-            )
-            if not counters[1] and alpha < score < beta:
-                score = -negamax(
-                    new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters, 1, history,
-                    hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                    killer_from, killer_to, killer_promo, history_table,
-                )
-        if counters[1]:
+    while True:
+        best_from, best_to, best_promo, best_score, completed = _search_root_pass(
+            bb, meta, depth, alpha, beta, deadline, counters, pv_from, pv_to, pv_promo,
+            history, hist_len, opponent_history, opponent_hist_len,
+            tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
+            killer_from, killer_to, killer_promo, history_table,
+            from_arr, to_arr, promo_arr, order, count,
+        )
+        if not completed:
             return best_from, best_to, best_promo, best_score, False
-        if claim_eligible_for_opponent(
-            new_bb, new_meta, history, hist_len, opponent_history, opponent_hist_len, 1
-        ):
-            score = min(score, 0)
-        if score > best_score:
-            best_score = score
-            best_from, best_to, best_promo = f, t, p
-        if best_score > alpha:
-            alpha = best_score
-
-    return best_from, best_to, best_promo, best_score, True
+        if (best_score <= alpha and alpha > -INF) or (best_score >= beta and beta < INF):
+            alpha, beta = -INF, INF
+            continue
+        return best_from, best_to, best_promo, best_score, True
 
 
 @njit(cache=False)

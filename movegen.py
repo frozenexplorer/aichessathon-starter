@@ -73,6 +73,29 @@ def piece_type_at(bb: np.ndarray, color: int, square: int) -> int:
 
 
 @njit(cache=False)
+def has_non_pawn_material(bb: np.ndarray, color: int) -> bool:
+    """False in a king+pawn(s)-only position for `color` -- the null-move zugzwang guard in
+    search.py (see its module docstring) skips null-move pruning here, since giving up a move for
+    free is exactly the wrong test when every move actually available is zugzwang.
+    """
+    base = color * 6
+    return bool(bb[base + KNIGHT] | bb[base + BISHOP] | bb[base + ROOK] | bb[base + QUEEN])
+
+
+@njit(cache=False)
+def make_null_move(meta: np.ndarray) -> np.ndarray:
+    """The position with the side to move passing -- same board, turn flipped, en passant rights
+    forfeited (a null move cannot itself be captured en passant, and the right does not survive a
+    move that isn't the double pawn push that created it). Used only for null-move pruning, never
+    as a real move.
+    """
+    new_meta = meta.copy()
+    new_meta[0] = 1 - meta[0]
+    new_meta[5] = NO_SQUARE
+    return new_meta
+
+
+@njit(cache=False)
 def make_move(
     bb: np.ndarray, meta: np.ndarray, from_sq: int, to_sq: int, promo: int
 ) -> tuple[np.ndarray, np.ndarray]:

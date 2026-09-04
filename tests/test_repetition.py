@@ -48,7 +48,7 @@ def call_negamax(hist_len: int, ply: int = 0) -> int:
     return sr.negamax(
         bb, meta, 0, -sr.INF, sr.INF, deadline, counters, ply, history, hist_len,
         tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-        killer_from, killer_to, killer_promo, history_table,
+        killer_from, killer_to, killer_promo, history_table, True, sr.MAX_CHECK_EXTENSIONS,
     )
 
 
