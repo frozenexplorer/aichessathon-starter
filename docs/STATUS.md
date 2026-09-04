@@ -1,6 +1,6 @@
 # Status
 
-Handoff snapshot as of the Tier 11 pass (2026-09-05), on top of Tiers 1-10 (Tier 2 commit
+Handoff snapshot as of the Tier 12 pass (2026-09-05), on top of Tiers 1-11 (Tier 2 commit
 `02ec418`, Tier 1 commit `12a38f9`), all documented in their own sections below. Read this instead
 of replaying the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
@@ -13,9 +13,10 @@ competition hardware, on the user's explicit direction. Each Tier 3+ item below 
 with the full correctness gate (`ruff`, `mypy --strict`, `tests/perft.py`,
 `tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`, from Tier 5 onward
 `tests/test_threats.py`, from Tier 6 onward `tests/test_quiescence_check.py`, from Tier 8 onward
-`tests/test_king_safety.py`, from Tier 10 onward `tests/test_fifty_move.py`, and from Tier 11
-onward `tests/test_insufficient_material.py`) plus functional games (checkmates from the start
-position and the KBN-vs-K tablebase endgame, both colours) before moving to the next.
+`tests/test_king_safety.py`, from Tier 10 onward `tests/test_fifty_move.py`, from Tier 11 onward
+`tests/test_insufficient_material.py`, and from Tier 12 onward `tests/test_timeman.py`) plus
+functional games (checkmates from the start position and the KBN-vs-K tablebase endgame, both
+colours) before moving to the next.
 
 ## Architecture
 
@@ -51,7 +52,8 @@ tablebase.py    Syzygy WDL + DTZ, root-only -- WDL filters to won/drawn-safe mov
 timeman.py      per-move budget (adaptive: a volatile position -- score swinging between
                 iterations, in check, a capture just played, or few pieces left -- can spend up
                 to timeman.EXTENSION_FACTOR times the base budget) + a hard low-clock panic
-                threshold
+                threshold; two stacked safety reservations (clock-proportional SAFETY_MARGIN_MS,
+                fixed POST_SEARCH_BUFFER_MS for real post-search-loop work)
 tests/perft.py               movegen verified against python-chess: differential testing over
                               random games (6 position types incl. Kiwipete) + perft node counts
 tests/test_repetition.py     direct unit tests of the repetition-draw and claim-eligibility logic
@@ -70,6 +72,8 @@ tests/test_fifty_move.py     negamax's fifty-move-rule draw detection: one ply s
                               limit (real score), at the limit and past it (immediate draw, 0)
 tests/test_insufficient_material.py  is_insufficient_material and negamax's use of it: four
                               recognised dead-draw shapes, three deliberately-unflagged ones
+tests/test_timeman.py        budget_ms/extended_budget_ms's two stacked safety reservations, and
+                              sane, non-negative output at very low clock values
 ```
 
 Everything under `weights/syzygy/` and every `.py` file above ships in the zip (`make zip`);
@@ -435,6 +439,29 @@ sides) checked against both `is_insufficient_material` directly and a live `nega
 (expecting score 0), plus three it must deliberately leave unflagged (opposite-colour bishops, a
 knight on each side, and a real material edge), checked against `is_insufficient_material` alone.
 
+## Tier 12: what changed and why
+
+1. **Move-overhead safety margin** (`timeman.py`) -- the existing `SAFETY_MARGIN_MS` (300ms,
+   subtracted from the clock before any planning formula runs) already hedges against unknown,
+   clock-proportional overhead, but nothing previously accounted for a second, distinct source:
+   fixed, non-clock-proportional real work that happens on every single move regardless of how
+   much time is left -- `agent._record_and_return`'s own post-search `make_move`/`position_hash`
+   bookkeeping, building the returned UCI string, and negamax/quiescence's own unavoidable
+   overshoot past a deadline (their time check only fires every `CHECK_INTERVAL` nodes, so a
+   deadline can be crossed by however long those last few nodes take before the next check
+   unwinds the search). Added `POST_SEARCH_BUFFER_MS = 20`, subtracted from the *planned budget
+   itself* (not the clock) in both `budget_ms` and `extended_budget_ms`, so the search loop's own
+   deadline sits that much earlier than the raw allocation, leaving headroom for this fixed
+   overhead before `get_move` actually hands control back to the harness. Two reservations
+   stacked rather than merged, since they model genuinely different things (see the module
+   docstring): one scales with the clock, the other does not.
+
+New dedicated test: `tests/test_timeman.py` (this module had none before) -- confirms
+`budget_ms`'s output is the raw planned allocation minus `POST_SEARCH_BUFFER_MS`, that
+`extended_budget_ms` never returns less than `budget_ms` while still respecting the same buffer,
+and that both stay sane (floor at `MIN_BUDGET_MS`, never negative) across a range of very low
+clock values.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -501,6 +528,12 @@ knight on each side, and a real material edge), checked against `is_insufficient
   all clean, plus the same functional in-process games -- including confirming KBN vs K still
   checkmates (the one common near-insufficient shape the conservative scoping deliberately does
   not clip). Same 8s-search throughput check as Tier 10, identical depth/node profile.
+- Tier 12: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks, threats,
+  quiescence-check, king-safety, fifty-move, insufficient-material) plus the new
+  `tests/test_timeman.py` all clean, plus the same functional in-process games (a pure timing
+  constant change, not a search-algorithm one, so the 8s-search throughput check does not apply
+  here -- functional games exercising the real `agent.get_move` path, which is the only consumer
+  of `timeman.budget_ms`/`extended_budget_ms`, is the relevant check).
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -584,7 +617,9 @@ insufficient-material draw detection inside search (currently absent -- tablebas
 root-only, so internal search nodes have no such awareness), and a move-overhead safety margin in
 `timeman.py` for real subprocess/IO latency in competition play. Tier 10 (fifty-move rule) and
 Tier 11 (insufficient material) picked up both draw-detection gaps -- see their sections above.
-The move-overhead safety margin and singular extensions remain open. Still not picked up:
+Tier 12 (move-overhead safety margin) picked that up too -- see its section above. Singular
+extensions is the last item from that discussion, and the highest-risk one (interacts with the
+existing extension budget) -- see its own section below once picked up. Still not picked up:
 generating a small custom endgame tablebase locally via retrograde analysis instead of downloading
 one (item 8's blocker) -- multi-day scope, not worth it against the time remaining unless
 everything else is done early.
