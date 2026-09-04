@@ -31,10 +31,9 @@ the whole game like the history arrays above, since positions can transpose acro
 choices even without repeating outright -- but unlike them, it never affects correctness: a stale
 or colliding entry can only cost some search accuracy, never mask a real repetition (negamax
 checks that first and never touches the table for a forced-draw node) or destabilize the
-claim-eligibility safety net above (which never consults it at all). Killer moves, the from/to
-history table, and the counter-move table are cheap move-ordering aids that encode this search's
-own cutoff history, not the position, so they are rebuilt fresh every call rather than carried
-across moves.
+claim-eligibility safety net above (which never consults it at all). Killer moves and the
+from/to history table are cheap move-ordering aids that encode this search's own cutoff history,
+not the position, so they are rebuilt fresh every call rather than carried across moves.
 """
 
 import time
@@ -58,10 +57,6 @@ _opponent_history_len = 0
 
 (_tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo) = sr.new_tt()
 
-# Piece count as of the previous get_move call's root, for the adaptive-time volatility check
-# below (_is_volatile) -- None until the first real move decision.
-_prev_piece_count: int | None = None
-
 
 def get_move(fen: str, time_left_ms: int) -> str:
     """Return a legal move in UCI notation.
@@ -70,7 +65,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     time_left_ms  your clock before this move, in milliseconds
     returns       "e2e4", or "e7e8q" for a promotion
     """
-    global _history_len, _opponent_history_len, _prev_piece_count
+    global _history_len, _opponent_history_len
 
     start = time.perf_counter()
     bb, meta = bbm.from_fen(fen)
@@ -100,76 +95,39 @@ def get_move(fen: str, time_left_ms: int) -> str:
         )
         return bbm.move_uci(best_from, best_to, best_promo)
 
-    base_deadline = start + timeman.budget_ms(time_left_ms) / 1000.0
-    max_deadline = start + timeman.extended_budget_ms(time_left_ms) / 1000.0
+    deadline = start + timeman.budget_ms(time_left_ms) / 1000.0
     hist_len = _history_len + 1
     killer_from, killer_to, killer_promo = sr.new_killers()
     history_table = sr.new_history_table()
-    counter_from, counter_to, counter_promo = sr.new_counter_table()
-    piece_count = tb.piece_count(bb)
 
     if allowed:
         best_from, best_to, best_promo = _search_restricted(
-            bb, meta, allowed, max_deadline, hist_len, killer_from, killer_to, killer_promo,
-            history_table, counter_from, counter_to, counter_promo,
+            bb, meta, allowed, deadline, hist_len, killer_from, killer_to, killer_promo,
+            history_table,
         )
     else:
         pv_from, pv_to, pv_promo = -1, -1, -1
-        prev_score: int | None = None
         depth = 1
         while True:
-            volatile = _is_volatile(bb, meta, prev_score, None, piece_count, _prev_piece_count)
-            deadline = max_deadline if volatile else base_deadline
             counters = sr.new_counters()
-            window_seed = sr.NO_PREV_SCORE if prev_score is None else prev_score
             f, t, p, score, completed = sr.search_root(
                 bb, meta, depth, deadline, counters, pv_from, pv_to, pv_promo,
                 _history, hist_len, _opponent_history, _opponent_history_len,
                 _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
                 killer_from, killer_to, killer_promo, history_table,
-                counter_from, counter_to, counter_promo, window_seed,
             )
             if f != -1:
                 best_from, best_to, best_promo = int(f), int(t), int(p)
             if not completed:
                 break
             pv_from, pv_to, pv_promo = f, t, p
-            still_volatile = _is_volatile(
-                bb, meta, prev_score, score, piece_count, _prev_piece_count
-            )
-            next_deadline = max_deadline if still_volatile else base_deadline
-            over_time = time.perf_counter() >= next_deadline
+            over_time = time.perf_counter() >= deadline
             if over_time or abs(score) >= MATE_THRESHOLD or depth >= MAX_DEPTH:
                 break
-            prev_score = score
             depth += 1
 
-    _prev_piece_count = piece_count
     best_from, best_to, best_promo = _record_and_return(bb, meta, best_from, best_to, best_promo)
     return bbm.move_uci(best_from, best_to, best_promo)
-
-
-def _is_volatile(
-    bb: np.ndarray,
-    meta: np.ndarray,
-    prev_score: int | None,
-    score: int | None,
-    piece_count: int,
-    prev_piece_count: int | None,
-) -> bool:
-    """Whether the position looks sharp enough to deserve more than the base time budget -- see
-    docs/FUTURE.md item 1: a score swing between the last two completed iterative-deepening
-    depths, a position not in a quiet state (in check, a capture just landed us here), or few
-    enough pieces left that precise endgame play matters.
-    """
-    swing = None if prev_score is None or score is None else abs(score - prev_score)
-    if swing is not None and swing >= timeman.SCORE_SWING_CP:
-        return True
-    if mg.is_check(bb, meta):
-        return True
-    if prev_piece_count is not None and piece_count < prev_piece_count:
-        return True
-    return piece_count <= timeman.LOW_PIECE_COUNT
 
 
 def _record_and_return(
@@ -197,9 +155,6 @@ def _search_restricted(
     killer_to: np.ndarray,
     killer_promo: np.ndarray,
     history_table: np.ndarray,
-    counter_from: np.ndarray,
-    counter_to: np.ndarray,
-    counter_promo: np.ndarray,
 ) -> tuple[int, int, int]:
     """Iterative deepening restricted to `moves` (already filtered to WDL/DTZ-optimal by the
     tablebase) -- same shape as the main loop, just over a smaller candidate set, so eval and
@@ -216,8 +171,7 @@ def _search_restricted(
             score = -sr.negamax(
                 new_bb, new_meta, depth - 1, -sr.INF, sr.INF, deadline, counters, 1, _history,
                 hist_len, _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
-                killer_from, killer_to, killer_promo, history_table, True, sr.MAX_CHECK_EXTENSIONS,
-                counter_from, counter_to, counter_promo, f, t,
+                killer_from, killer_to, killer_promo, history_table,
             )
             if counters[1]:
                 break
@@ -248,12 +202,10 @@ def _warm_up() -> None:
     opponent_history = np.zeros(sr.HISTORY_CAPACITY, dtype=np.uint64)
     killer_from, killer_to, killer_promo = sr.new_killers()
     history_table = sr.new_history_table()
-    counter_from, counter_to, counter_promo = sr.new_counter_table()
     sr.search_root(
         bb, meta, 2, deadline, counters, -1, -1, -1, history, 1, opponent_history, 0,
         _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
         killer_from, killer_to, killer_promo, history_table,
-        counter_from, counter_to, counter_promo, sr.NO_PREV_SCORE,
     )
     from_arr, to_arr, promo_arr, count = mg.generate_legal(bb, meta)
     sr.quick_best_move(bb, meta, from_arr, to_arr, promo_arr, count)

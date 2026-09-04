@@ -4,10 +4,13 @@ Ranked by strength-gained-per-day-of-effort given the 2026-09-11 11:00 London de
 raw impact alone. Tier 1 (transposition table, killer/history move ordering, PVS, DTZ tablebase,
 tapered/richer evaluation) and Tier 2 (items 1-7 below) are both shipped; see `docs/STATUS.md`
 for what each covers and the current verified state, including why items 8-10 remain undone for
-reasons specific to each, not time pressure. Re-run `tests/perft.py`, `tests/test_repetition.py`,
-`tests/test_see.py`, `tests/test_magic_attacks.py`, `ruff`, and `mypy --strict` after any change
-to `search.py`, `movegen.py`, or `attacks.py`, and re-check init time (see `docs/STATUS.md`) if it
-climbs and holds well above the harness's own 60s budget.
+reasons specific to each, not time pressure. A further Tier 3 pass (mobility eval, futility
+pruning, a bigger two-tier TT, internal iterative deepening, a counter-move heuristic, delta
+pruning) is also shipped on top of this list -- not itself tracked here since it wasn't part of
+the original prioritization; see `docs/STATUS.md`'s Tier 3 section. Re-run `tests/perft.py`,
+`tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`, `ruff`, and
+`mypy --strict` after any change to `search.py`, `movegen.py`, `attacks.py`, or `evaluate.py`. Do
+not gate on local init-time measurements (see `docs/STATUS.md`'s final call on this).
 
 1. **[DONE, Tier 2] Adaptive time management** (`timeman.py`) -- the flat `time_left/30 + increment` formula
    gives a razor-sharp middlegame the same budget as a simplified endgame. This is not

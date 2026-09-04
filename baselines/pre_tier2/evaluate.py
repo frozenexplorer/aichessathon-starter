@@ -8,21 +8,18 @@ endgame-only table (centralizing instead of hiding in a castled corner), blended
 -- a king that wants safety mid-game is instead an active piece needed for the win once material
 has thinned out.
 
-Beyond material + PST, five cheap positional terms are added, all in the same white-minus-black,
+Beyond material + PST, four cheap positional terms are added, all in the same white-minus-black,
 own-file/precomputed-mask style as the rest of this module so they stay jit-friendly without a
 second pass over the board: pawn structure (doubled, isolated, passed), bishop pair, rooks on
-open/semi-open files, a king pawn-shield bonus that -- like the king PST -- fades out via the
-same phase blend as material comes off the board, and piece mobility (knight/bishop/rook/queen
-squares attacked, excluding squares held by an own piece) -- affordable per node now that sliding
-attacks are magic-bitboard lookups (see attacks.py) rather than ray-casts.
+open/semi-open files, and a king pawn-shield bonus that -- like the king PST -- fades out via the
+same phase blend as material comes off the board.
 """
 
 import numpy as np
 from numba import njit
 
-from attacks import KNIGHT_ATTACKS, bishop_attacks, queen_attacks, rook_attacks
 from bitboard import BISHOP, BLACK, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE
-from movegen import king_square, occ_color
+from movegen import generate_legal, king_square
 
 PIECE_VALUE = np.array([100, 320, 330, 500, 900, 0], dtype=np.int32)
 
@@ -291,51 +288,11 @@ def piece_features(bb: np.ndarray, phase: int) -> int:
 
 
 @njit(cache=False)
-def mobility_score(bb: np.ndarray) -> int:
-    """Differential piece mobility (white minus black): for each knight/bishop/rook/queen, the
-    squares it attacks that aren't occupied by a piece of its own colour, one flat weight per
-    square regardless of piece type -- a real per-piece activity signal (independent of whose
-    turn it is), unlike counting the side to move's total legal moves. Pawns and kings are
-    excluded: pawn mobility barely varies and rewarding king mobility encourages an unsafe king
-    walk, especially mid-game.
-    """
-    score = np.int32(0)
-    white_occ = occ_color(bb, WHITE)
-    black_occ = occ_color(bb, BLACK)
-    all_occ = white_occ | black_occ
-
-    for square in range(64):
-        bit = ONE << np.uint64(square)
-        if bb[WHITE * 6 + KNIGHT] & bit:
-            score += _popcount64(KNIGHT_ATTACKS[square] & ~white_occ)
-        if bb[BLACK * 6 + KNIGHT] & bit:
-            score -= _popcount64(KNIGHT_ATTACKS[square] & ~black_occ)
-        if bb[WHITE * 6 + BISHOP] & bit:
-            score += _popcount64(bishop_attacks(square, all_occ) & ~white_occ)
-        if bb[BLACK * 6 + BISHOP] & bit:
-            score -= _popcount64(bishop_attacks(square, all_occ) & ~black_occ)
-        if bb[WHITE * 6 + ROOK] & bit:
-            score += _popcount64(rook_attacks(square, all_occ) & ~white_occ)
-        if bb[BLACK * 6 + ROOK] & bit:
-            score -= _popcount64(rook_attacks(square, all_occ) & ~black_occ)
-        if bb[WHITE * 6 + QUEEN] & bit:
-            score += _popcount64(queen_attacks(square, all_occ) & ~white_occ)
-        if bb[BLACK * 6 + QUEEN] & bit:
-            score -= _popcount64(queen_attacks(square, all_occ) & ~black_occ)
-
-    return int(score) * int(MOBILITY_WEIGHT)
-
-
-@njit(cache=False)
-def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
+def evaluate(bb: np.ndarray, meta: np.ndarray, mobility: int) -> int:
     phase = game_phase(bb)
-    score = (
-        material_and_pst(bb, phase)
-        + pawn_structure(bb)
-        + piece_features(bb, phase)
-        + mobility_score(bb)
-    )
-    return int(score) if meta[0] == WHITE else int(-score)
+    score = material_and_pst(bb, phase) + pawn_structure(bb) + piece_features(bb, phase)
+    signed = score if meta[0] == WHITE else -score
+    return int(signed + MOBILITY_WEIGHT * mobility)
 
 
 def warm_up() -> None:
@@ -344,4 +301,5 @@ def warm_up() -> None:
     bb, meta = from_fen(
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
     )
-    evaluate(bb, meta)
+    _, _, _, count = generate_legal(bb, meta)
+    evaluate(bb, meta, count)

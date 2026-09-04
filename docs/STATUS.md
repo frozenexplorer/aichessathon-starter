@@ -1,9 +1,18 @@
 # Status
 
-Handoff snapshot as of the Tier 2 pass (2026-09-04), on top of the Tier 1 pass (commit `12a38f9`)
-documented below. Read this instead of replaying the whole build history. Competition context:
-uploads close 2026-09-11 11:00 London; the rated ladder runs hourly 08:00-22:00; Daily Five runs
-2026-09-06 through 2026-09-10.
+Handoff snapshot as of the Tier 3 pass (2026-09-05), on top of Tier 2 (commit `02ec418`) and Tier 1
+(commit `12a38f9`), both documented below. Read this instead of replaying the whole build history.
+Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
+08:00-22:00; Daily Five runs 2026-09-06 through 2026-09-10.
+
+Init time is no longer tracked here as a gating concern: this dev machine's numbers (which drift
+into the 55-70s range depending on what's landed in `search.py`, and have caused real init
+failures in local `harness.play`/`harness.arena` runs) are not assumed to reflect the actual
+competition hardware, on the user's explicit direction. Each Tier 3 item below was still verified
+with the full correctness gate (`ruff`, `mypy --strict`, `tests/perft.py`,
+`tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`) plus functional
+games (checkmates from the start position and the KBN-vs-K tablebase endgame, both colours) before
+moving to the next.
 
 ## Architecture
 
@@ -20,13 +29,14 @@ attacks.py      precomputed knight/king/pawn tables; sliding pieces (bishop/rook
 movegen.py      pseudo-legal + legal generation, copy-make (not incremental make/unmove)
 evaluate.py     tapered material + PST (midgame/endgame king blend by game phase), pawn
                 structure (doubled/isolated/passed), bishop pair, rook open/semi-open files,
-                king pawn-shield -- all jitted
+                king pawn-shield, differential piece mobility -- all jitted
 zobrist.py      position hashing, for repetition detection and the transposition table
-search.py       negamax/alpha-beta, iterative deepening, a transposition table, killer-move +
-                history move ordering, principal variation search (PVS) with aspiration windows,
-                null-move pruning, late move reductions, check extensions, static exchange
-                evaluation (move ordering + quiescence pruning), quiescence, repetition-draw
-                scoring, panic-mode fallback
+search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table,
+                killer-move + history + counter-move ordering, principal variation search (PVS)
+                with aspiration windows, null-move pruning, late move reductions, check
+                extensions, futility pruning, internal iterative deepening, static exchange
+                evaluation (move ordering + quiescence SEE/delta pruning), quiescence,
+                repetition-draw scoring, panic-mode fallback
 tablebase.py    Syzygy WDL + DTZ, root-only -- WDL filters to won/drawn-safe moves, DTZ narrows
                 further to the ones that actually make progress
 timeman.py      per-move budget (adaptive: a volatile position -- score swinging between
@@ -142,6 +152,52 @@ likely-wasted effort without them. **NN evaluation** (item 10) was explicitly de
 fundamentally different, multi-day scope (data/self-play, training, ONNX export, integration) that
 FUTURE.md itself gates on "everything above done with real days to spare."
 
+## Tier 3: what changed and why
+
+A second round beyond `docs/FUTURE.md`'s original list, proposed as further optimizations once
+that list was exhausted and picked up all at once on request. Same discipline as Tier 2: each
+checked against the full correctness gate plus functional games before the next.
+
+1. **Mobility eval term** (`evaluate.py`) -- replaced the previous crude proxy (the side to move's
+   total legal move count, added as a flat bonus in `evaluate()`'s old signature) with a real
+   differential term: for each knight/bishop/rook/queen, the squares it attacks that aren't held
+   by an own piece, white minus black, one flat weight per square (`mobility_score()`). Affordable
+   per node now that sliding attacks are magic-bitboard lookups rather than ray-casts (Tier 2 item
+   7) -- the previous proxy was partly a workaround for how expensive a real per-piece mobility
+   scan would have been before that. `evaluate()` dropped its `mobility` parameter entirely, only
+   ever called from quiescence's stand-pat.
+2. **Futility pruning** (`search.py`) -- at a shallow (`FUTILITY_MAX_DEPTH`), non-check node, a
+   quiet, non-check move is skipped outright once the static eval plus a depth-scaled margin
+   (`FUTILITY_MARGIN`) still can't reach alpha. `oi == 0` (the hash/best-ordered move) is never
+   skipped, so the node always has at least one fully-searched move to report a score from.
+3. **Bigger, two-tier transposition table** (`search.py`) -- grown from 2^20 always-replace entries
+   (~20MB) to 2^21 buckets, two slots each (~80MB): a depth-preferred slot (kept unless a same-key
+   refresh or a search that went at least as deep wants it) plus an always-replace slot, so a deep
+   result isn't evicted by shallow, plentiful ones, while a node from the current search is never
+   simply dropped for lack of a slot. `_tt_resolve` factors the shared probe-and-cutoff logic
+   (mate-distance adjustment, bound comparison) out to one place, checked against both slots.
+4. **Internal iterative deepening** (`search.py`) -- a node deep enough (`IID_MIN_DEPTH`) with a
+   genuine TT miss (no hash move at all, not merely one too shallow for a cutoff) searches itself
+   at a reduced depth purely to seed move ordering, implemented by re-invoking `negamax` on the
+   exact same position and re-probing the TT for whatever move its own store just wrote -- no
+   second return value threaded through `negamax` just for this.
+5. **Counter-move heuristic** (`search.py`) -- a table indexed by the move that led to a node
+   (`parent_from`/`parent_to`, now threaded through `negamax` and every recursive call site)
+   records whatever quiet move most recently caused a cutoff in reply to it, giving move ordering
+   a more targeted signal than the existing from/to history table alone. Ranked between killers and
+   history in `_score_moves2`. Rebuilt fresh per real move decision, like killers and history.
+6. **Delta pruning** (`search.py`, quiescence) -- complements SEE-pruning (Tier 2 item 4): a
+   capture whose SEE, added to stand-pat, still can't reach alpha within `DELTA_MARGIN` is skipped,
+   catching the case SEE-pruning alone misses (a real but too-small material gain against a large
+   existing deficit). Same SEE-descending order makes both conditions one monotonic `break`.
+
+Threading `parent_from`/`parent_to` and the counter-move table through `negamax`,
+`_search_root_pass`, `search_root`, `agent._search_restricted`, and the `_warm_up` and
+`test_repetition.py` call sites (item 5) was the widest-blast-radius change of this pass --
+verified specifically by running `tests/test_repetition.py` (calls `negamax` directly) before the
+broader suite, since a wrong argument count there would surface immediately as a `TypeError`
+rather than silently.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -162,6 +218,17 @@ FUTURE.md itself gates on "everything above done with real days to spare."
 - Functional in-process games (bypassing the harness subprocess so init time doesn't gate the
   check) after every Tier 2 item: no crashes, no illegal moves, checkmates both colours from the
   standard start position throughout.
+- `baselines/pre_tier2/` is a frozen, standalone copy of the engine as it stood at the end of
+  Tier 2 (commit `02ec418`) -- created this session as a real, on-disk comparison point (unlike
+  the `baselines/pre_tier1/` referenced above, which is not actually present in this checkout).
+  Not part of the submission (`harness.package` only ships root-level `.py` files).
+- Tier 3: same full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks tests) plus
+  functional in-process games (checkmates both colours from the start position, and 2/2 KBN-vs-K
+  tablebase-endgame checkmates exercising `agent._search_restricted`) after every item, all clean.
+  The counter-move heuristic's signature threading (negamax, `_search_root_pass`, `search_root`,
+  `_search_restricted`, `_warm_up`, and `test_repetition.py`) was verified by running
+  `tests/test_repetition.py` first specifically, since it calls `negamax` directly and a wrong
+  argument count there surfaces immediately as a `TypeError`.
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -208,10 +275,25 @@ judged worse than the risk. Revisit if real competition results show init failur
 The earlier KBN-vs-K "Known issue" from before Tier 1 is closed by DTZ (Tier 1 item 4 above) and
 was folded into the Tier 1 section rather than kept as an open issue.
 
+**Final call for Tier 3 and beyond (explicit, superseding the re-check-ceiling approach above):**
+stop tracking this dev machine's init-time number as a gating concern at all. Confirmed
+empirically that numba's on-disk caching (`cache=True` + `NUMBA_CACHE_DIR`) is not a viable
+workaround -- every jitted function in this codebase touches a module-level global array (attack
+tables, PSTs, magic tables), and numba explicitly refuses to cache any function that does
+("Cannot cache compiled function ... uses dynamic globals"), so there is no cheap fix available
+here even if it mattered. Going forward: verify with the correctness gate and functional games,
+same as every item above; do not re-run local `harness.play`/`harness.arena` init timing as a
+check step.
+
 ## Future
 
 See `docs/FUTURE.md` -- items 1-7 (adaptive time management, aspiration windows, null-move
 pruning, SEE, LMR, search extensions, magic bitboards) are the Tier 2 work above. Items 8-10
 (curated 5-man tablebase subset, opening book, NN evaluation) remain undone for the
 item-specific reasons in the Tier 2 section above, not for lack of time -- see there before
-picking any of them back up.
+picking any of them back up. Tier 3 (mobility eval, futility pruning, a bigger two-tier TT, IID,
+counter-move heuristic, delta pruning) is a second round of optimizations beyond FUTURE.md's
+original list -- not itself tracked in FUTURE.md, see the Tier 3 section above instead. Further
+ideas raised but not yet picked up: endgame-specific eval terms (king-distance-to-passed-pawn,
+rank-scaled passed-pawn bonus), and generating a small custom endgame tablebase locally via
+retrograde analysis instead of downloading one (item 8's blocker).
