@@ -258,7 +258,10 @@ def _warm_up() -> None:
     from_arr, to_arr, promo_arr, count = mg.generate_legal(bb, meta)
     sr.quick_best_move(bb, meta, from_arr, to_arr, promo_arr, count)
     new_bb, new_meta = mg.make_move(bb, meta, int(from_arr[0]), int(to_arr[0]), int(promo_arr[0]))
-    sr.quiescence(new_bb, new_meta, -sr.INF, sr.INF, time.perf_counter() + 5.0, counters, 4)
+    sr.quiescence(
+        new_bb, new_meta, -sr.INF, sr.INF, time.perf_counter() + 5.0, counters, 4,
+        sr.QSEARCH_CHECK_BUDGET,
+    )
     sr.claim_eligible_for_opponent(new_bb, new_meta, history, 1, opponent_history, 0, 1)
     tb.best_moves("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1")
 

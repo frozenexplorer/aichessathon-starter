@@ -1,8 +1,8 @@
 # Status
 
-Handoff snapshot as of the Tier 5 pass (2026-09-05), on top of Tier 4, Tier 3, Tier 2 (commit
-`02ec418`), and Tier 1 (commit `12a38f9`), all documented below. Read this instead of replaying
-the whole build history.
+Handoff snapshot as of the Tier 6 pass (2026-09-05), on top of Tier 5, Tier 4, Tier 3, Tier 2
+(commit `02ec418`), and Tier 1 (commit `12a38f9`), all documented below. Read this instead of
+replaying the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
 08:00-22:00; Daily Five runs 2026-09-06 through 2026-09-10.
 
@@ -11,9 +11,10 @@ into the 55-70s range depending on what's landed in `search.py`, and have caused
 failures in local `harness.play`/`harness.arena` runs) are not assumed to reflect the actual
 competition hardware, on the user's explicit direction. Each Tier 3+ item below was still verified
 with the full correctness gate (`ruff`, `mypy --strict`, `tests/perft.py`,
-`tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`, and from Tier 5
-onward `tests/test_threats.py`) plus functional games (checkmates from the start position and the
-KBN-vs-K tablebase endgame, both colours) before moving to the next.
+`tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`, from Tier 5 onward
+`tests/test_threats.py`, and from Tier 6 onward `tests/test_quiescence_check.py`) plus functional
+games (checkmates from the start position and the KBN-vs-K tablebase endgame, both colours) before
+moving to the next.
 
 ## Architecture
 
@@ -39,8 +40,9 @@ search.py       negamax/alpha-beta, iterative deepening, a two-tier transpositio
                 killer-move + history + counter-move ordering, principal variation search (PVS)
                 with aspiration windows, null-move pruning, late move reductions, check
                 extensions, futility pruning, internal iterative deepening, static exchange
-                evaluation (move ordering + quiescence SEE/delta pruning), quiescence,
-                repetition-draw scoring, panic-mode fallback
+                evaluation (move ordering + quiescence SEE/delta pruning), quiescence (including
+                a bounded full-width search of check evasions, not just captures, when the side
+                to move is in check), repetition-draw scoring, panic-mode fallback
 tablebase.py    Syzygy WDL + DTZ, root-only -- WDL filters to won/drawn-safe moves, DTZ narrows
                 further to the ones that actually make progress
 timeman.py      per-move budget (adaptive: a volatile position -- score swinging between
@@ -57,6 +59,8 @@ tests/test_magic_attacks.py  magic-bitboard lookups differentially tested agains
 tests/test_threats.py        fork/hanging-piece/pin/x-ray eval terms against hand-constructed
                               positions, isolated from the rest of evaluate() by calling
                               threats_score/pin_and_xray_score directly
+tests/test_quiescence_check.py  quiescence's in-check evasion search against an old-vs-fixed
+                              check_budget comparison, plus a genuine checkmate control case
 ```
 
 Everything under `weights/syzygy/` and every `.py` file above ships in the zip (`make zip`);
@@ -271,6 +275,38 @@ x-ray/skewer, and a bare-kings control case expecting exactly zero) calling `thr
 `pin_and_xray_score` directly rather than through the full `evaluate()`, so each case isolates the
 mechanism under test from PST/mobility/pawn-structure noise.
 
+## Tier 6: what changed and why
+
+A real search bug, found while investigating why middlegame tactics were still being missed after
+Tier 5's eval additions -- not a new feature, a fix:
+
+1. **Quiescence did not handle being in check** (`search.py`) -- `quiescence()` always computed a
+   static `stand_pat` and only ever searched captures (plus queen promotions), with no special
+   case for the side to move being in check. But there is no "decline to respond" option while in
+   check, and a legal evasion that is not itself a capture (a king step, a block) was never even
+   looked at -- if the only escapes from check were non-captures, `ncap == 0` and the function
+   returned the parent node's own stand-pat unconditionally, treating a position where the side to
+   move might be getting mated as if it were quiet. Captures routinely give check, so this
+   triggered on any quiescence-depth capture sequence that landed on a checking position, which is
+   common -- very plausibly a bigger contributor to "missed tactics" than any single eval term.
+   Fixed: when in check, `quiescence` now skips the stand-pat/beta-cutoff shortcut and searches
+   every legal move (the movegen already restricts to legal evasions when in check), the same
+   posture as a normal negamax node. Bounded by a new `check_budget` parameter (mirroring
+   negamax's own `ext_budget`/`MAX_CHECK_EXTENSIONS`, new constant `QSEARCH_CHECK_BUDGET = 6`)
+   rather than `qdepth`, since quiescence carries no history array and so cannot detect a
+   perpetual-check line via repetition the way negamax can -- once the budget is exhausted, a
+   still-in-check node falls back to the old stand-pat/captures-only path so recursion still
+   terminates.
+
+New dedicated test: `tests/test_quiescence_check.py` -- calls `quiescence` on the same in-check,
+zero-legal-captures position with `check_budget=0` (reproducing the old behaviour exactly, since
+the budget that would trigger the new evasion search is already spent) versus the real
+`QSEARCH_CHECK_BUDGET`, and asserts the two disagree (proving the fixed path actually searches the
+forced king move rather than reusing the parent's stand-pat), plus a genuine checkmate control case
+(fool's mate) confirming the pre-existing `count == 0` handling is unaffected. A fixed 8s search on
+the Tier 1 blunder-position FEN reached the same depth 6 complete / depth 7 partial as before the
+fix (123K vs. 133K nodes, well within normal run-to-run variance) -- no throughput regression.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -310,6 +346,10 @@ mechanism under test from PST/mobility/pawn-structure noise.
   ray-isolation bug described above) all clean, plus the same functional in-process games. A fixed
   8s search on the Tier 1 blunder-position FEN still reached depth 6 complete / depth 7 partial
   (133K nodes) with both new terms active, confirming no meaningful throughput regression.
+- Tier 6: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks, threats) plus the
+  new `tests/test_quiescence_check.py` all clean, plus the same functional in-process games. Same
+  8s-search throughput check as Tier 5, unaffected (depth 6 complete / depth 7 partial, 123K
+  nodes).
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -378,7 +418,12 @@ original list -- not itself tracked in FUTURE.md, see the Tier 3 section above i
 (phase-blended passed-pawn bonus, king-distance-to-passed-pawn) picked up one of the two further
 ideas noted here previously -- see the Tier 4 section above. Tier 5 (fork/hanging-piece/pawn-
 threat and pin/x-ray/skewer eval terms) was picked up on a direct user report that middlegame
-tactics were still being missed -- see the Tier 5 section above. Still not picked up: generating a
-small custom endgame tablebase locally via retrograde analysis instead of downloading one (item
-8's blocker) -- multi-day scope, not worth it against the time remaining unless everything else is
-done early.
+tactics were still being missed -- see the Tier 5 section above. Tier 6 (the quiescence-in-check
+fix) came from the same report, found while looking for further eval-side tactical terms to add --
+see the Tier 6 section above. From the same "further ideas" discussion: history malus (penalize
+quiet moves that fail to cause a cutoff, not just reward the ones that do) and a king-safety eval
+term (attacker count/weight near the enemy king, not just the existing pawn-shield bonus) are
+next in line if picked back up, then reverse futility/static-null pruning, late move pruning, and
+singular extensions as further search-side levers. Still not picked up: generating a small custom
+endgame tablebase locally via retrograde analysis instead of downloading one (item 8's blocker) --
+multi-day scope, not worth it against the time remaining unless everything else is done early.

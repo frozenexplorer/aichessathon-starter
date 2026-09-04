@@ -80,6 +80,17 @@ capture that genuinely wins material but not enough to close a large existing ga
 SEE-descending move order as SEE-pruning makes both a single monotonic break condition (see
 quiescence's move loop): once either trips, every remaining, lower-scored capture trips it too.
 
+Quiescence in check: none of the above (stand-pat, capture-only move generation) is valid while
+the side to move is in check -- there is no "decline to respond" option, and a legal evasion that
+is not itself a capture (a king step, a block) is otherwise never even generated. quiescence
+special-cases this: skip the stand-pat/beta cutoff and search every legal move (generate_legal
+already restricts to legal evasions when in check), the same posture as a normal negamax node.
+Bounded by its own check_budget (mirroring negamax's ext_budget/MAX_CHECK_EXTENSIONS) rather than
+qdepth, since quiescence carries no history array and so cannot detect a perpetual-check line via
+repetition the way negamax can -- once check_budget runs out, a still-in-check node falls back to
+the ordinary stand-pat/captures-only path so recursion still terminates. This only extends,
+matching how the same forcing-line reasoning already works for search extensions elsewhere.
+
 Late move reductions: inside negamax's move loop (never at the root -- search_root explores every
 root move at full depth), a quiet move late enough in the ordering (see LMR_MIN_MOVE_INDEX) gets
 searched one ply shallower first, on the premise that TT/killer/history ordering has already
@@ -172,6 +183,7 @@ MATE = 1_000_000
 INF = 2_000_000
 CHECK_INTERVAL = 127
 QUIESCENCE_MAX_PLIES = 24
+QSEARCH_CHECK_BUDGET = 6
 ONE = np.uint64(1)
 
 # Delta pruning in quiescence: a capture whose SEE, added to the stand-pat eval, still can't
@@ -491,6 +503,7 @@ def quiescence(
     deadline: float,
     counters: np.ndarray,
     qdepth: int,
+    check_budget: int,
 ) -> int:
     counters[0] += 1
     if _time_up(deadline, counters):
@@ -499,6 +512,21 @@ def quiescence(
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     if count == 0:
         return -MATE if is_check(bb, meta) else 0
+
+    if check_budget > 0 and is_check(bb, meta):
+        for i in range(count):
+            f, t, p = from_arr[i], to_arr[i], promo_arr[i]
+            new_bb, new_meta = make_move(bb, meta, f, t, p)
+            score = -quiescence(
+                new_bb, new_meta, -beta, -alpha, deadline, counters, qdepth, check_budget - 1
+            )
+            if counters[1]:
+                return 0
+            if score >= beta:
+                return beta
+            if score > alpha:
+                alpha = score
+        return alpha
 
     stand_pat = evaluate(bb, meta)
     if stand_pat >= beta:
@@ -532,7 +560,9 @@ def quiescence(
             break
         f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
         new_bb, new_meta = make_move(bb, meta, f, t, p)
-        score = -quiescence(new_bb, new_meta, -beta, -alpha, deadline, counters, qdepth - 1)
+        score = -quiescence(
+            new_bb, new_meta, -beta, -alpha, deadline, counters, qdepth - 1, check_budget
+        )
         if counters[1]:
             return 0
         if score >= beta:
@@ -658,7 +688,9 @@ def negamax(
         return -MATE if is_check(bb, meta) else 0
 
     if depth <= 0:
-        return quiescence(bb, meta, alpha, beta, deadline, counters, QUIESCENCE_MAX_PLIES)
+        return quiescence(
+            bb, meta, alpha, beta, deadline, counters, QUIESCENCE_MAX_PLIES, QSEARCH_CHECK_BUDGET
+        )
 
     in_check = is_check(bb, meta)
 
