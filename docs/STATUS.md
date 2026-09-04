@@ -1,19 +1,19 @@
 # Status
 
-Handoff snapshot as of the Tier 4 pass (2026-09-05), on top of Tier 3, Tier 2 (commit `02ec418`),
-and Tier 1 (commit `12a38f9`), all documented below. Read this instead of replaying the whole
-build history.
+Handoff snapshot as of the Tier 5 pass (2026-09-05), on top of Tier 4, Tier 3, Tier 2 (commit
+`02ec418`), and Tier 1 (commit `12a38f9`), all documented below. Read this instead of replaying
+the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
 08:00-22:00; Daily Five runs 2026-09-06 through 2026-09-10.
 
 Init time is no longer tracked here as a gating concern: this dev machine's numbers (which drift
 into the 55-70s range depending on what's landed in `search.py`, and have caused real init
 failures in local `harness.play`/`harness.arena` runs) are not assumed to reflect the actual
-competition hardware, on the user's explicit direction. Each Tier 3 item below was still verified
+competition hardware, on the user's explicit direction. Each Tier 3+ item below was still verified
 with the full correctness gate (`ruff`, `mypy --strict`, `tests/perft.py`,
-`tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`) plus functional
-games (checkmates from the start position and the KBN-vs-K tablebase endgame, both colours) before
-moving to the next.
+`tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`, and from Tier 5
+onward `tests/test_threats.py`) plus functional games (checkmates from the start position and the
+KBN-vs-K tablebase endgame, both colours) before moving to the next.
 
 ## Architecture
 
@@ -31,7 +31,9 @@ movegen.py      pseudo-legal + legal generation, copy-make (not incremental make
 evaluate.py     tapered material + PST (midgame/endgame king blend by game phase), pawn
                 structure (doubled/isolated/passed, the passed-pawn bonus itself phase-blended),
                 bishop pair, rook open/semi-open files, king pawn-shield, differential piece
-                mobility, king proximity to passed-pawn promotion squares -- all jitted
+                mobility, king proximity to passed-pawn promotion squares, tactical threat
+                awareness (hanging pieces, pawn threats, forks, absolute pins, x-rays/skewers) --
+                all jitted
 zobrist.py      position hashing, for repetition detection and the transposition table
 search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table,
                 killer-move + history + counter-move ordering, principal variation search (PVS)
@@ -52,6 +54,9 @@ tests/test_see.py            static exchange evaluation against hand-computed wi
                               equal/x-ray exchanges
 tests/test_magic_attacks.py  magic-bitboard lookups differentially tested against the plain
                               ray-cast reference over random occupancies, all 64 squares
+tests/test_threats.py        fork/hanging-piece/pin/x-ray eval terms against hand-constructed
+                              positions, isolated from the rest of evaluate() by calling
+                              threats_score/pin_and_xray_score directly
 ```
 
 Everything under `weights/syzygy/` and every `.py` file above ships in the zip (`make zip`);
@@ -218,6 +223,54 @@ unpicked -- multi-day scope not worth it against the time remaining):
      there first tends to decide whether the pawn queens or gets caught). Zero-cost in the
      middlegame (`endgame_weight == 0` short-circuits before the board scan).
 
+## Tier 5: what changed and why
+
+User-reported: the engine was still missing middlegame tactics -- forks, pins, x-rays/skewers --
+that a shallow, depth-limited search cannot see until it searches far enough ahead to reach the
+actual capture, even though search already extends check sequences and orders captures by SEE.
+Two new eval terms give the *static* evaluation, at every leaf node, awareness of these patterns
+one ply after the threatening move is made, not just once the capture itself is on the board:
+
+1. **`threats_score`** (`evaluate.py`) -- attacker-centric (loop over our own pieces, look at what
+   each attacks, not the reverse): a bonus for a pawn attacking a more valuable piece, a bonus for
+   any piece attacking an enemy piece with no defender (`movegen.attacked_by`), and a fork bonus
+   when one piece attacks two or more enemy pieces at once -- the enemy king counts toward the
+   fork count (attacking it is still only one of the two-plus pieces the opponent must choose
+   between saving) but is excluded from the hanging-piece bonus itself, since "check" is already
+   search's job, not eval's.
+2. **`pin_and_xray_score`** (`evaluate.py`) -- for each of our sliding pieces, the nearest enemy
+   piece it attacks under full occupancy is a pin/x-ray candidate; recomputing the same ray with
+   just that candidate removed reveals whatever sits directly behind it (if anything) -- the same
+   "discovered attacker falls out for free" trick `search.see` already uses for the same reason,
+   rather than tracking rays incrementally. An enemy king revealed behind the candidate is an
+   absolute pin (scaled by the pinned piece's own value, since a more valuable pinned piece is a
+   bigger constraint); another enemy piece revealed is a skewer/x-ray, scaled up further when the
+   revealed piece is worth more than the candidate in front of it.
+
+Caught one real implementation bug during its own verification, not in gameplay: the first version
+of `_ray_pin_score` intersected the recomputed ray against *all* remaining pieces on the board
+rather than only the newly-revealed squares beyond the candidate, so an unrelated blocker on a
+different ray direction (e.g. our own king sitting on the same rank) could be picked up by
+`_bit_scan` instead of the real piece behind the candidate -- caught by `tests/test_threats.py`'s
+skewer case scoring 0 when hand-computation said it should be positive; fixed by intersecting
+against `extended & ~full` (squares reachable only after removing the candidate) before looking
+for a piece there.
+
+Both terms are cheap relative to the rest of `evaluate.py`: `threats_score` iterates each piece's
+own bitboard directly (bit-scan-and-clear, not a 64-square scan) and reuses the same attack-table
+lookups mobility scoring already does; `pin_and_xray_score` only does extra ray recomputation for
+the (typically 0-2) enemy pieces a slider directly touches, not every square on the board. A fixed
+8-second search on the exact blunder-position FEN from Tier 1's investigation (`docs/STATUS.md`'s
+own earlier note) still reached depth 6 complete / depth 7 partial (133K nodes) after adding both
+terms, confirming no meaningful throughput collapse from the extra per-node work.
+
+New dedicated test: `tests/test_threats.py`, same style as `tests/test_see.py` -- five
+hand-constructed positions (a king+queen fork with an undefended queen, a defended-attacker/
+undefended-target case built so a naive symmetric read would net to zero, an absolute pin, an
+x-ray/skewer, and a bare-kings control case expecting exactly zero) calling `threats_score` and
+`pin_and_xray_score` directly rather than through the full `evaluate()`, so each case isolates the
+mechanism under test from PST/mobility/pawn-structure noise.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -252,6 +305,11 @@ unpicked -- multi-day scope not worth it against the time remaining):
 - Tier 4: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks) clean, plus
   functional in-process games (checkmates both colours from the start position, 2/2 KBN-vs-K
   tablebase-endgame checkmates) after the eval change.
+- Tier 5: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks) plus the new
+  `tests/test_threats.py` (5 hand-constructed positions, including the skewer case that caught the
+  ray-isolation bug described above) all clean, plus the same functional in-process games. A fixed
+  8s search on the Tier 1 blunder-position FEN still reached depth 6 complete / depth 7 partial
+  (133K nodes) with both new terms active, confirming no meaningful throughput regression.
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -318,7 +376,9 @@ picking any of them back up. Tier 3 (mobility eval, futility pruning, a bigger t
 counter-move heuristic, delta pruning) is a second round of optimizations beyond FUTURE.md's
 original list -- not itself tracked in FUTURE.md, see the Tier 3 section above instead. Tier 4
 (phase-blended passed-pawn bonus, king-distance-to-passed-pawn) picked up one of the two further
-ideas noted here previously -- see the Tier 4 section above. Still not picked up: generating a
+ideas noted here previously -- see the Tier 4 section above. Tier 5 (fork/hanging-piece/pawn-
+threat and pin/x-ray/skewer eval terms) was picked up on a direct user report that middlegame
+tactics were still being missed -- see the Tier 5 section above. Still not picked up: generating a
 small custom endgame tablebase locally via retrograde analysis instead of downloading one (item
 8's blocker) -- multi-day scope, not worth it against the time remaining unless everything else is
 done early.

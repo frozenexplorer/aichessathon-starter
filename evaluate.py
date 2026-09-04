@@ -19,14 +19,31 @@ affordable per node now that sliding attacks are magic-bitboard lookups (see att
 than ray-casts -- and, phased in the same way as the passed-pawn bonus, king proximity to each
 passed pawn's promotion square (the "rule of the square" -- whichever king is closer tends to
 decide whether the pawn queens or gets caught).
+
+Two more terms cover tactical motifs a depth-limited search can miss until it searches far enough
+to reach the actual capture, but which are visible one ply after the threatening move is made if
+eval itself notices: `threats_score` (a pawn attacking a more valuable piece, an attacked piece
+with no defender, and a fork bonus when one piece attacks two or more enemy pieces -- including
+the enemy king -- at once, since the opponent can only save one) and `pin_and_xray_score`
+(absolute pins to the king, plus skewers/x-rays -- a second enemy piece directly behind the first
+along the same ray from one of our sliders). Both recompute the ray with a candidate blocker
+removed rather than tracking rays incrementally, the same "discovered attacker falls out for free"
+trick `search.see` already relies on for the same reason.
 """
 
 import numpy as np
 from numba import njit
 
-from attacks import KNIGHT_ATTACKS, bishop_attacks, queen_attacks, rook_attacks
+from attacks import (
+    KING_ATTACKS,
+    KNIGHT_ATTACKS,
+    PAWN_ATTACKS,
+    bishop_attacks,
+    queen_attacks,
+    rook_attacks,
+)
 from bitboard import BISHOP, BLACK, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE
-from movegen import king_square, occ_color
+from movegen import attacked_by, king_square, occ_color, piece_type_at
 
 PIECE_VALUE = np.array([100, 320, 330, 500, 900, 0], dtype=np.int32)
 
@@ -122,6 +139,12 @@ ROOK_SEMI_OPEN_BONUS = np.int32(10)
 ROOK_OPEN_BONUS = np.int32(20)
 KING_SHIELD_BONUS = np.int32(8)
 KING_DISTANCE_WEIGHT = np.int32(4)
+PAWN_THREAT_BONUS = np.int32(35)
+HANGING_PIECE_DIVISOR = np.int32(8)
+FORK_BONUS = np.int32(30)
+PIN_KING_DIVISOR = np.int32(6)
+XRAY_FLAT_BONUS = np.int32(6)
+XRAY_HEAVY_DIVISOR = np.int32(10)
 
 
 def _build_file_masks() -> np.ndarray:
@@ -373,6 +396,166 @@ def mobility_score(bb: np.ndarray) -> int:
 
 
 @njit(cache=False)
+def _bit_scan(bits: np.uint64) -> int:
+    for square in range(64):
+        if bits & (ONE << np.uint64(square)):
+            return square
+    return -1
+
+
+@njit(cache=False)
+def threats_score(bb: np.ndarray) -> int:
+    """A pawn attacking a more valuable piece, any piece attacking an undefended enemy piece, and
+    a fork bonus when one piece attacks two or more enemy pieces (the enemy king included, since
+    that is still only one of the two-plus pieces the opponent can save) at once. Attacker-centric
+    (loop over our pieces, look at what each attacks) rather than victim-centric, since a fork is
+    naturally a property of the attacking piece, not any one of its targets.
+    """
+    score = np.int32(0)
+    white_occ = occ_color(bb, WHITE)
+    black_occ = occ_color(bb, BLACK)
+    all_occ = white_occ | black_occ
+
+    for color in range(2):
+        sign = np.int32(1) if color == WHITE else np.int32(-1)
+        enemy = 1 - color
+        enemy_occ = black_occ if color == WHITE else white_occ
+        enemy_king_bb = bb[enemy * 6 + KING]
+
+        remaining = bb[color * 6 + PAWN]
+        while remaining:
+            sq = _bit_scan(remaining)
+            remaining &= remaining - ONE
+            hit = PAWN_ATTACKS[color, sq] & enemy_occ & ~bb[enemy * 6 + PAWN]
+            if hit:
+                score += sign * PAWN_THREAT_BONUS * np.int32(_popcount64(hit))
+
+        for pt in (KNIGHT, BISHOP, ROOK, QUEEN, KING):
+            remaining = bb[color * 6 + pt]
+            while remaining:
+                sq = _bit_scan(remaining)
+                remaining &= remaining - ONE
+                if pt == KNIGHT:
+                    atk = KNIGHT_ATTACKS[sq]
+                elif pt == BISHOP:
+                    atk = bishop_attacks(sq, all_occ)
+                elif pt == ROOK:
+                    atk = rook_attacks(sq, all_occ)
+                elif pt == QUEEN:
+                    atk = queen_attacks(sq, all_occ)
+                else:
+                    atk = KING_ATTACKS[sq]
+
+                all_hits = atk & enemy_occ
+                if all_hits == 0:
+                    continue
+                hit_count = _popcount64(all_hits)
+                if hit_count >= 2:
+                    score += sign * FORK_BONUS * np.int32(hit_count - 1)
+
+                sub = all_hits & ~enemy_king_bb
+                while sub:
+                    tsq = _bit_scan(sub)
+                    sub &= sub - ONE
+                    if not attacked_by(bb, all_occ, enemy, tsq):
+                        target_pt = piece_type_at(bb, enemy, tsq)
+                        score += sign * (PIECE_VALUE[target_pt] // HANGING_PIECE_DIVISOR)
+
+    return int(score)
+
+
+@njit(cache=False)
+def _ray_pin_score(
+    bb: np.ndarray,
+    sq: int,
+    all_occ: np.uint64,
+    own_occ: np.uint64,
+    enemy_occ: np.uint64,
+    enemy: int,
+    enemy_king_bb: np.uint64,
+    use_bishop: bool,
+) -> int:
+    full = bishop_attacks(sq, all_occ) if use_bishop else rook_attacks(sq, all_occ)
+    candidates = full & enemy_occ & ~enemy_king_bb
+    total = 0
+    remaining = candidates
+    while remaining:
+        c = _bit_scan(remaining)
+        remaining &= remaining - ONE
+        occ_without = all_occ & ~(ONE << np.uint64(c))
+        extended = (
+            bishop_attacks(sq, occ_without) if use_bishop else rook_attacks(sq, occ_without)
+        )
+        # Isolate to squares newly reachable now that c is gone -- extended still includes every
+        # other ray's original blocker unchanged (e.g. an own piece on a different rank/diagonal),
+        # and intersecting the whole thing against occ_without would wrongly pick those up too.
+        revealed = (extended & ~full) & occ_without
+        if revealed == 0 or revealed & own_occ:
+            continue
+        candidate_pt = piece_type_at(bb, enemy, c)
+        if revealed & enemy_king_bb:
+            total += int(PIECE_VALUE[candidate_pt]) // int(PIN_KING_DIVISOR)
+        else:
+            revealed_sq = _bit_scan(revealed)
+            revealed_pt = piece_type_at(bb, enemy, revealed_sq)
+            bonus = int(XRAY_FLAT_BONUS)
+            if PIECE_VALUE[revealed_pt] > PIECE_VALUE[candidate_pt]:
+                diff = int(PIECE_VALUE[revealed_pt]) - int(PIECE_VALUE[candidate_pt])
+                bonus += diff // int(XRAY_HEAVY_DIVISOR)
+            total += bonus
+    return total
+
+
+@njit(cache=False)
+def pin_and_xray_score(bb: np.ndarray) -> int:
+    """Absolute pins (a piece that cannot move without exposing its own king to one of our
+    sliders) and skewers/x-rays (a second enemy piece directly behind the first along the same
+    ray) -- both invisible to a search that has not yet looked past the first blocker on that ray,
+    but real pressure a static eval can flag as soon as the pinning/skewering piece is placed.
+    """
+    score = np.int32(0)
+    white_occ = occ_color(bb, WHITE)
+    black_occ = occ_color(bb, BLACK)
+    all_occ = white_occ | black_occ
+
+    for color in range(2):
+        sign = np.int32(1) if color == WHITE else np.int32(-1)
+        enemy = 1 - color
+        own_occ = white_occ if color == WHITE else black_occ
+        enemy_occ = black_occ if color == WHITE else white_occ
+        enemy_king_bb = bb[enemy * 6 + KING]
+
+        remaining = bb[color * 6 + BISHOP]
+        while remaining:
+            sq = _bit_scan(remaining)
+            remaining &= remaining - ONE
+            score += sign * _ray_pin_score(
+                bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb, True
+            )
+
+        remaining = bb[color * 6 + ROOK]
+        while remaining:
+            sq = _bit_scan(remaining)
+            remaining &= remaining - ONE
+            score += sign * _ray_pin_score(
+                bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb, False
+            )
+
+        remaining = bb[color * 6 + QUEEN]
+        while remaining:
+            sq = _bit_scan(remaining)
+            remaining &= remaining - ONE
+            score += sign * _ray_pin_score(
+                bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb, True
+            )
+            score += sign * _ray_pin_score(
+                bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb, False
+            )
+
+    return int(score)
+
+
+@njit(cache=False)
 def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
     phase = game_phase(bb)
     score = (
@@ -381,6 +564,8 @@ def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
         + piece_features(bb, phase)
         + mobility_score(bb)
         + passed_pawn_king_distance(bb, phase)
+        + threats_score(bb)
+        + pin_and_xray_score(bb)
     )
     return int(score) if meta[0] == WHITE else int(-score)
 
