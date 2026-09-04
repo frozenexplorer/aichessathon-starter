@@ -1,8 +1,8 @@
 # Status
 
-Handoff snapshot as of the Tier 6 pass (2026-09-05), on top of Tier 5, Tier 4, Tier 3, Tier 2
-(commit `02ec418`), and Tier 1 (commit `12a38f9`), all documented below. Read this instead of
-replaying the whole build history.
+Handoff snapshot as of the Tier 7 pass (2026-09-05), on top of Tier 6, Tier 5, Tier 4, Tier 3,
+Tier 2 (commit `02ec418`), and Tier 1 (commit `12a38f9`), all documented below. Read this instead
+of replaying the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
 08:00-22:00; Daily Five runs 2026-09-06 through 2026-09-10.
 
@@ -307,6 +307,24 @@ forced king move rather than reusing the parent's stand-pat), plus a genuine che
 the Tier 1 blunder-position FEN reached the same depth 6 complete / depth 7 partial as before the
 fix (123K vs. 133K nodes, well within normal run-to-run variance) -- no throughput regression.
 
+## Tier 7: what changed and why
+
+1. **History malus** (`search.py`) -- at a beta cutoff, the from/to history table previously only
+   rewarded the cutoff move itself (`history_table[f*64+t] += depth*depth`). It now also penalises,
+   by that same magnitude, every other quiet move already tried at that node before the cutoff
+   (they had the same chance to cut off and didn't) -- not merely withheld a bonus, but pushed
+   below an untried, `history == 0` move the next time `_score_moves2` consults the table. Doubles
+   the resolution of the heuristic (a move's score now reflects both how often it cuts off and how
+   often it was tried and failed to), which matters most in exactly the sharp, many-candidate
+   tactical positions this and Tier 5/6 exist for. One extra pass over the moves already tried
+   before the cutoff, bounded by the same move list the node already generated -- no new movegen.
+
+No new dedicated test: this changes move-ordering quality only, never correctness (a cutoff still
+requires the real search to prove alpha >= beta; history only affects which order moves are tried
+in), so it is covered by the existing full gate plus functional games rather than a new unit test.
+A fixed 8s search on the Tier 1 blunder-position FEN reached the same depth 6 complete / depth 7
+partial as Tier 6 (127K nodes, consistent with normal run-to-run variance) -- no regression.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -350,6 +368,9 @@ fix (123K vs. 133K nodes, well within normal run-to-run variance) -- no throughp
   new `tests/test_quiescence_check.py` all clean, plus the same functional in-process games. Same
   8s-search throughput check as Tier 5, unaffected (depth 6 complete / depth 7 partial, 123K
   nodes).
+- Tier 7: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks, threats,
+  quiescence-check) all clean, plus the same functional in-process games. Same 8s-search
+  throughput check as Tier 6, unaffected (depth 6 complete / depth 7 partial, 127K nodes).
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -424,6 +445,8 @@ see the Tier 6 section above. From the same "further ideas" discussion: history 
 quiet moves that fail to cause a cutoff, not just reward the ones that do) and a king-safety eval
 term (attacker count/weight near the enemy king, not just the existing pawn-shield bonus) are
 next in line if picked back up, then reverse futility/static-null pruning, late move pruning, and
-singular extensions as further search-side levers. Still not picked up: generating a small custom
-endgame tablebase locally via retrograde analysis instead of downloading one (item 8's blocker) --
-multi-day scope, not worth it against the time remaining unless everything else is done early.
+singular extensions as further search-side levers. Tier 7 (history malus) picked up the first of
+those two -- see the Tier 7 section above; the king-safety eval term is still open. Still not
+picked up: generating a small custom endgame tablebase locally via retrograde analysis instead of
+downloading one (item 8's blocker) -- multi-day scope, not worth it against the time remaining
+unless everything else is done early.

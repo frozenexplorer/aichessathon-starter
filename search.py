@@ -39,6 +39,14 @@ this specific opponent move," a more targeted signal than the from/to history ta
 one. All three are rebuilt fresh per real move decision (agent.py allocates them per get_move
 call), since they encode this search's own cutoff history, not anything about the position itself.
 
+History malus: at a beta cutoff, every other quiet move already tried at that same node (earlier
+in the ordering, so it had the same chance to cut off) is penalised in history_table by the same
+magnitude the actual cutoff move is rewarded by -- not merely withheld a bonus, but pushed below
+an untried (history == 0) move the next time ordering consults it. Doubles the resolution of the
+history heuristic (a move's score now reflects both how often it cuts off and how often it was
+tried and didn't) at the cost of one extra pass over the moves already tried before the cutoff --
+bounded by the same move list this node already generated, not a new one.
+
 Principal variation search: the first move at each node (hash move or best-scoring by ordering)
 is searched with the full alpha-beta window; every other move first gets a cheap null-window
 probe (-alpha-1, -alpha) and is only re-searched with the full window if that probe suggests it
@@ -841,17 +849,29 @@ def negamax(
             alpha = best
         if alpha >= beta:
             if p < 0 and not is_capture(bb, meta, f, t):
+                bonus = depth * depth
                 if not (f == k1_from and t == k1_to and p == k1_promo):
                     killer_from[ply, 1], killer_to[ply, 1], killer_promo[ply, 1] = (
                         killer_from[ply, 0], killer_to[ply, 0], killer_promo[ply, 0],
                     )
                     killer_from[ply, 0], killer_to[ply, 0], killer_promo[ply, 0] = f, t, p
-                history_table[f * 64 + t] += depth * depth
+                history_table[f * 64 + t] += bonus
                 if parent_from >= 0:
                     cm_idx = parent_from * 64 + parent_to
                     counter_from[cm_idx] = np.int8(f)
                     counter_to[cm_idx] = np.int8(t)
                     counter_promo[cm_idx] = np.int8(p)
+                # History malus: every other quiet move already tried at this node had the same
+                # chance to cut off and didn't, so it is penalised by the same magnitude the
+                # actual cutoff move is rewarded by -- not just "not rewarded", actively pushed
+                # below untried (history == 0) moves next time. Sharpens ordering everywhere,
+                # which matters most in exactly the sharp, many-candidate tactical positions this
+                # tier exists for.
+                for oi2 in range(oi):
+                    idx2 = order[oi2]
+                    f2, t2, p2 = from_arr[idx2], to_arr[idx2], promo_arr[idx2]
+                    if p2 < 0 and not is_capture(bb, meta, f2, t2):
+                        history_table[f2 * 64 + t2] -= bonus
             break
 
     # Two-tier replacement: prefer the depth-preferred slot on a same-key refresh, an empty slot
