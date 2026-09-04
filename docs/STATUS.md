@@ -1,8 +1,8 @@
 # Status
 
-Handoff snapshot as of the Tier 10 pass (2026-09-05), on top of Tiers 1-9 (Tier 2 commit `02ec418`,
-Tier 1 commit `12a38f9`), all documented in their own sections below. Read this instead of
-replaying the whole build history.
+Handoff snapshot as of the Tier 11 pass (2026-09-05), on top of Tiers 1-10 (Tier 2 commit
+`02ec418`, Tier 1 commit `12a38f9`), all documented in their own sections below. Read this instead
+of replaying the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
 08:00-22:00; Daily Five runs 2026-09-06 through 2026-09-10.
 
@@ -13,9 +13,9 @@ competition hardware, on the user's explicit direction. Each Tier 3+ item below 
 with the full correctness gate (`ruff`, `mypy --strict`, `tests/perft.py`,
 `tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`, from Tier 5 onward
 `tests/test_threats.py`, from Tier 6 onward `tests/test_quiescence_check.py`, from Tier 8 onward
-`tests/test_king_safety.py`, and from Tier 10 onward `tests/test_fifty_move.py`) plus functional
-games (checkmates from the start position and the KBN-vs-K tablebase endgame, both colours) before
-moving to the next.
+`tests/test_king_safety.py`, from Tier 10 onward `tests/test_fifty_move.py`, and from Tier 11
+onward `tests/test_insufficient_material.py`) plus functional games (checkmates from the start
+position and the KBN-vs-K tablebase endgame, both colours) before moving to the next.
 
 ## Architecture
 
@@ -29,7 +29,8 @@ attacks.py      precomputed knight/king/pawn tables; sliding pieces (bishop/rook
                 magic bitboards -- a per-square lookup table indexed by
                 ((occupied & mask) * magic) >> shift, magic numbers precomputed offline and
                 hardcoded (see the module docstring), no runtime magic search
-movegen.py      pseudo-legal + legal generation, copy-make (not incremental make/unmove)
+movegen.py      pseudo-legal + legal generation, copy-make (not incremental make/unmove);
+                is_insufficient_material -- a conservative, path-independent dead-draw check
 evaluate.py     tapered material + PST (midgame/endgame king blend by game phase), pawn
                 structure (doubled/isolated/passed, the passed-pawn bonus itself phase-blended),
                 bishop pair, rook open/semi-open files, king pawn-shield, differential piece
@@ -67,6 +68,8 @@ tests/test_king_safety.py    king_safety_score against a hand-built king-ring-pr
                               its sign-mirrored counterpart, a phase-0 fade-out, and a quiet control
 tests/test_fifty_move.py     negamax's fifty-move-rule draw detection: one ply short of the
                               limit (real score), at the limit and past it (immediate draw, 0)
+tests/test_insufficient_material.py  is_insufficient_material and negamax's use of it: four
+                              recognised dead-draw shapes, three deliberately-unflagged ones
 ```
 
 Everything under `weights/syzygy/` and every `.py` file above ships in the zip (`make zip`);
@@ -405,6 +408,33 @@ New dedicated test: `tests/test_fifty_move.py` -- the same "up a rook" fixture a
 `tests/test_repetition.py`, checked one ply short of `HALFMOVE_DRAW_LIMIT` (must still show the
 real material edge), exactly at the limit, and past it (both must score as an immediate draw).
 
+## Tier 11: what changed and why
+
+1. **Insufficient-material draw detection** (`movegen.py`, `is_insufficient_material`; used in
+   `search.py`'s `negamax` and `quiescence`) -- the other half of the draw-detection gap raised
+   alongside the fifty-move rule (Tier 10). Unlike the halfmove clock, this is a pure,
+   path-independent property of the current board alone, so it needed no parameter threading at
+   all: both functions check it directly, immediately after their existing early-return checks,
+   and return an immediate draw (0) when it holds. Deliberately conservative (see the function's
+   own docstring) -- true only for bare king vs bare king, king plus exactly one minor piece
+   against a bare king, or any number of bishops (no pawns/knights/rooks/queens) all on one square
+   colour; every other combination, including ones the full FIDE rule also treats as insufficient
+   (a knight on each side), returns False, which is always the safe direction: eval simply runs
+   as normal, exactly as if the check did not exist. This does not protect the real game result --
+   the harness's own `Board.outcome()` already treats insufficient material as an automatic,
+   non-claim terminal condition on the actual position played -- it exists purely so the search's
+   own evaluation of a hypothetical such position reached while descending the tree is accurate
+   (an exact 0) rather than running ordinary material/PST/threat scoring on a position that is
+   provably a dead draw. Confirmed the conservative scoping doesn't clip a real endgame the
+   engine actually needs to win: KBN vs K (bishop and knight together, not covered by the
+   single-minor case) still checkmates in the functional-game check below, unaffected.
+
+New dedicated test: `tests/test_insufficient_material.py` -- four hand-built positions the
+function must recognise (bare kings, king+knight, king+bishop, same-colour-square bishops both
+sides) checked against both `is_insufficient_material` directly and a live `negamax` call
+(expecting score 0), plus three it must deliberately leave unflagged (opposite-colour bishops, a
+knight on each side, and a real material edge), checked against `is_insufficient_material` alone.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -466,6 +496,11 @@ real material edge), exactly at the limit, and past it (both must score as an im
   functional in-process games. Same 8s-search throughput check as Tier 9, identical depth/node
   profile (depth 8 complete / depth 9 partial) -- the new check never fires in that position
   (halfmove_clock starts at 3), confirming zero overhead when the rule is not in play.
+- Tier 11: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks, threats,
+  quiescence-check, king-safety, fifty-move) plus the new `tests/test_insufficient_material.py`
+  all clean, plus the same functional in-process games -- including confirming KBN vs K still
+  checkmates (the one common near-insufficient shape the conservative scoping deliberately does
+  not clip). Same 8s-search throughput check as Tier 10, identical depth/node profile.
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -547,8 +582,9 @@ continuing this list (higher risk/effort, interacts with the existing extension 
 two correctness/robustness gaps raised in the same discussion: fifty-move-rule and
 insufficient-material draw detection inside search (currently absent -- tablebase probing is
 root-only, so internal search nodes have no such awareness), and a move-overhead safety margin in
-`timeman.py` for real subprocess/IO latency in competition play. Tier 10 picked up the fifty-move-
-rule half of that -- see the Tier 10 section above; the move-overhead safety margin and singular
-extensions remain open. Still not picked up: generating a small custom endgame tablebase locally
-via retrograde analysis instead of downloading one (item 8's blocker) -- multi-day scope, not
-worth it against the time remaining unless everything else is done early.
+`timeman.py` for real subprocess/IO latency in competition play. Tier 10 (fifty-move rule) and
+Tier 11 (insufficient material) picked up both draw-detection gaps -- see their sections above.
+The move-overhead safety margin and singular extensions remain open. Still not picked up:
+generating a small custom endgame tablebase locally via retrograde analysis instead of downloading
+one (item 8's blocker) -- multi-day scope, not worth it against the time remaining unless
+everything else is done early.

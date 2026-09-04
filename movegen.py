@@ -21,6 +21,22 @@ ONE = np.uint64(1)
 NO_SQUARE = np.int8(-1)
 
 
+def _build_square_color_mask() -> np.uint64:
+    """One bit per square whose (file + rank) is even -- an arbitrary but fixed partition of the
+    board into two colour classes, used only to tell whether a set of bishops all sit on the same
+    square colour (see is_insufficient_material below); which class is called "light" or "dark"
+    never matters, only that the partition is consistent.
+    """
+    bits = np.uint64(0)
+    for square in range(64):
+        if (square % 8 + square // 8) % 2 == 0:
+            bits |= ONE << np.uint64(square)
+    return bits
+
+
+SQUARE_COLOR_MASK = _build_square_color_mask()
+
+
 @njit(cache=False)
 def occ_color(bb: np.ndarray, color: int) -> np.uint64:
     occ = np.uint64(0)
@@ -70,6 +86,46 @@ def piece_type_at(bb: np.ndarray, color: int, square: int) -> int:
         if bb[color * 6 + pt] & bit:
             return pt
     return -1
+
+
+@njit(cache=False)
+def _popcount64(bits: np.uint64) -> int:
+    count = 0
+    while bits:
+        bits &= bits - ONE
+        count += 1
+    return count
+
+
+@njit(cache=False)
+def is_insufficient_material(bb: np.ndarray) -> bool:
+    """Conservative dead-draw recognition, deliberately narrower than the full FIDE rule (or
+    python-chess's own Board.is_insufficient_material(), which the harness's Board.outcome()
+    already applies to the real game state as an automatic, non-claim terminal condition -- so
+    this exists purely to keep the search's own eval of a hypothetical such position accurate
+    while descending the tree, not to protect the real game result, which the harness already
+    guarantees regardless). True only for: a bare king against a bare king; a king plus exactly
+    one minor piece (knight or bishop) against a bare king; or any number of bishops -- with no
+    pawns, knights, rooks, or queens anywhere -- all confined to squares of one colour. Every
+    other combination (including ones the full rule also treats as insufficient, like a knight on
+    each side) returns False, which is always the safe direction: eval simply runs as normal,
+    exactly as if this check did not exist.
+    """
+    if (
+        bb[WHITE * 6 + PAWN] or bb[BLACK * 6 + PAWN]
+        or bb[WHITE * 6 + ROOK] or bb[BLACK * 6 + ROOK]
+        or bb[WHITE * 6 + QUEEN] or bb[BLACK * 6 + QUEEN]
+    ):
+        return False
+    knights = bb[WHITE * 6 + KNIGHT] | bb[BLACK * 6 + KNIGHT]
+    bishops = bb[WHITE * 6 + BISHOP] | bb[BLACK * 6 + BISHOP]
+    if knights:
+        return bishops == 0 and _popcount64(knights) <= 1
+    if bishops == 0:
+        return True
+    same_light = (bishops & SQUARE_COLOR_MASK) == bishops
+    same_dark = (bishops & ~SQUARE_COLOR_MASK) == bishops
+    return bool(same_light or same_dark)
 
 
 @njit(cache=False)

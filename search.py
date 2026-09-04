@@ -195,11 +195,24 @@ reused for both the recursive call and (previously) the redundant is_capture cal
 futility/LMP/LMR checks just above it. At HALFMOVE_DRAW_LIMIT (100 plies), a node returns an
 immediate draw (0), checked in the same early position as the repetition check above (before the
 transposition table) and for the same reason -- a cached score must never mask a real forced draw.
-Root-only correctness gap, deliberately accepted: quiescence does not thread or check this, since
-its own additional plies either reset the count immediately (a capture) or are bounded to a
+Main-search-only correctness gap, deliberately accepted: quiescence does not thread or check the
+running count itself (see is_insufficient_material below for the one draw check it does share),
+since its own additional plies either reset the count immediately (a capture) or are bounded to a
 handful (the in-check evasion search, QSEARCH_CHECK_BUDGET) -- missing the exact ply the count
 crosses 100 inside that narrow window is a negligible risk against the complexity of threading a
 seventh parameter through quiescence's own recursion for it.
+
+Insufficient material: movegen.is_insufficient_material(bb) is a pure, path-independent property
+of the current board alone (bare king vs bare king, king plus exactly one minor against a bare
+king, or same-coloured-square bishops only -- see its own docstring for the deliberately
+conservative subset and why under-detecting is always the safe direction), so unlike the fifty-move
+count it needs no parameter threading at all: negamax and quiescence both check it directly,
+immediately after the halfmove/time-up checks, and both return an immediate draw (0) when it
+holds. This does not protect the real game result -- the harness's own Board.outcome() already
+treats insufficient material as an automatic, non-claim terminal condition on the actual position
+played -- it exists purely so the search's own evaluation of a hypothetical such position reached
+while descending the tree is accurate rather than running ordinary material/PST/threat scoring on
+a position that is provably a dead draw.
 """
 
 import time
@@ -214,6 +227,7 @@ from movegen import (
     generate_legal,
     has_non_pawn_material,
     is_check,
+    is_insufficient_material,
     make_move,
     make_null_move,
     occ_all,
@@ -560,6 +574,9 @@ def quiescence(
     if _time_up(deadline, counters):
         return 0
 
+    if is_insufficient_material(bb):
+        return 0
+
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     if count == 0:
         return -MATE if is_check(bb, meta) else 0
@@ -696,6 +713,9 @@ def negamax(
         return 0
 
     if halfmove_clock >= HALFMOVE_DRAW_LIMIT:
+        return 0
+
+    if is_insufficient_material(bb):
         return 0
 
     h = position_hash(bb, meta)
