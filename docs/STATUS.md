@@ -1,6 +1,6 @@
 # Status
 
-Handoff snapshot as of the Tier 9 pass (2026-09-05), on top of Tiers 1-8 (Tier 2 commit `02ec418`,
+Handoff snapshot as of the Tier 10 pass (2026-09-05), on top of Tiers 1-9 (Tier 2 commit `02ec418`,
 Tier 1 commit `12a38f9`), all documented in their own sections below. Read this instead of
 replaying the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
@@ -12,7 +12,8 @@ failures in local `harness.play`/`harness.arena` runs) are not assumed to reflec
 competition hardware, on the user's explicit direction. Each Tier 3+ item below was still verified
 with the full correctness gate (`ruff`, `mypy --strict`, `tests/perft.py`,
 `tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`, from Tier 5 onward
-`tests/test_threats.py`, and from Tier 6 onward `tests/test_quiescence_check.py`) plus functional
+`tests/test_threats.py`, from Tier 6 onward `tests/test_quiescence_check.py`, from Tier 8 onward
+`tests/test_king_safety.py`, and from Tier 10 onward `tests/test_fifty_move.py`) plus functional
 games (checkmates from the start position and the KBN-vs-K tablebase endgame, both colours) before
 moving to the next.
 
@@ -64,6 +65,8 @@ tests/test_quiescence_check.py  quiescence's in-check evasion search against an 
                               check_budget comparison, plus a genuine checkmate control case
 tests/test_king_safety.py    king_safety_score against a hand-built king-ring-pressure position,
                               its sign-mirrored counterpart, a phase-0 fade-out, and a quiet control
+tests/test_fifty_move.py     negamax's fifty-move-rule draw detection: one ply short of the
+                              limit (real score), at the limit and past it (immediate draw, 0)
 ```
 
 Everything under `weights/syzygy/` and every `.py` file above ships in the zip (`make zip`);
@@ -377,6 +380,31 @@ partial** with far fewer nodes per depth (e.g. depth 7: 90K nodes vs. Tier 8's d
 182K) -- the two prunes compounding with the existing futility/null-move/LMR stack rather than
 duplicating their effect.
 
+## Tier 10: what changed and why
+
+1. **Fifty-move-rule draw detection** (`search.py`, `bitboard.py`) -- a real correctness gap,
+   raised while listing further ideas: nothing in the engine tracked or checked the fifty-move
+   rule (100 plies with no pawn move or capture is an automatic draw), so a winning line could in
+   principle shuffle pieces in the search tree without the engine ever realising the clock mattered
+   (tablebase probing, the only other draw-aware mechanism besides repetition, is root-only and
+   only covers <= `tb.MAX_PIECES`). Added `bitboard.halfmove_clock(fen)` (reads the FEN's own
+   halfmove field via python-chess, each `get_move` call, rather than tracked incrementally --
+   correct even if a game does not start at 0) and threaded a `halfmove_clock: int` parameter
+   through `negamax`/`_search_root_pass`/`search_root`/`agent._search_restricted`, reset to 0 for
+   a child move that is a pawn move or capture, incremented by 1 otherwise. At
+   `HALFMOVE_DRAW_LIMIT` (100), a node returns an immediate draw (0) -- checked in the same early
+   position as the repetition check, before the transposition table, for the same reason (a cached
+   score must never mask a real forced draw). Deliberately scoped to the main search tree, not
+   threaded through quiescence -- see the module docstring's "Fifty-move rule" paragraph for why
+   that gap is an accepted, negligible-risk simplification rather than an oversight. Computing
+   `child_halfmove_clock` once per move in negamax's loop also let the three separate,
+   already-redundant `is_capture` calls in the futility/LMP/LMR checks collapse into one cached
+   `is_cap` variable, reused by all of them.
+
+New dedicated test: `tests/test_fifty_move.py` -- the same "up a rook" fixture as
+`tests/test_repetition.py`, checked one ply short of `HALFMOVE_DRAW_LIMIT` (must still show the
+real material edge), exactly at the limit, and past it (both must score as an immediate draw).
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -433,6 +461,11 @@ duplicating their effect.
   8s-search throughput check reached depth 8 complete / depth 9 partial, a real jump from Tier 8's
   depth 6 complete / depth 7 partial, with far fewer nodes per depth (e.g. depth 7: 90K vs. Tier
   8's depth-7-partial 182K) -- the two new prunes compounding with the existing stack as intended.
+- Tier 10: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks, threats,
+  quiescence-check, king-safety) plus the new `tests/test_fifty_move.py` all clean, plus the same
+  functional in-process games. Same 8s-search throughput check as Tier 9, identical depth/node
+  profile (depth 8 complete / depth 9 partial) -- the new check never fires in that position
+  (halfmove_clock starts at 3), confirming zero overhead when the rule is not in play.
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -514,7 +547,8 @@ continuing this list (higher risk/effort, interacts with the existing extension 
 two correctness/robustness gaps raised in the same discussion: fifty-move-rule and
 insufficient-material draw detection inside search (currently absent -- tablebase probing is
 root-only, so internal search nodes have no such awareness), and a move-overhead safety margin in
-`timeman.py` for real subprocess/IO latency in competition play. Still not picked up: generating a
-small custom endgame tablebase locally via retrograde analysis instead of downloading one (item
-8's blocker) -- multi-day scope, not worth it against the time remaining unless everything else is
-done early.
+`timeman.py` for real subprocess/IO latency in competition play. Tier 10 picked up the fifty-move-
+rule half of that -- see the Tier 10 section above; the move-overhead safety margin and singular
+extensions remain open. Still not picked up: generating a small custom endgame tablebase locally
+via retrograde analysis instead of downloading one (item 8's blocker) -- multi-day scope, not
+worth it against the time remaining unless everything else is done early.

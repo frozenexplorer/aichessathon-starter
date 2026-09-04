@@ -184,6 +184,22 @@ merely offers the position is treated the same as one that plays it. Root-only, 
 negamax's own recursion: condition one is a full extra movegen per candidate move, affordable
 once per real move decision but not throughout the tree. Untouched by the transposition table --
 it always recomputes from the real history arrays, never from a cached score.
+
+Fifty-move rule: `halfmove_clock`, threaded through negamax/_search_root_pass/search_root the same
+way `hist_len` is, counts plies since the last pawn move or capture on the current path -- the
+real game's own value (bitboard.halfmove_clock(fen), read straight from the FEN each get_move
+call rather than tracked incrementally, so it is correct even if a game does not start at 0) plus
+whatever the search itself has added while descending. Reset to 0 for a child whose move is a pawn
+move or capture, otherwise incremented by 1 -- computed once per move in negamax's own loop and
+reused for both the recursive call and (previously) the redundant is_capture calls in the
+futility/LMP/LMR checks just above it. At HALFMOVE_DRAW_LIMIT (100 plies), a node returns an
+immediate draw (0), checked in the same early position as the repetition check above (before the
+transposition table) and for the same reason -- a cached score must never mask a real forced draw.
+Root-only correctness gap, deliberately accepted: quiescence does not thread or check this, since
+its own additional plies either reset the count immediately (a capture) or are bounded to a
+handful (the in-check evasion search, QSEARCH_CHECK_BUDGET) -- missing the exact ply the count
+crosses 100 inside that narrow window is a negligible risk against the complexity of threading a
+seventh parameter through quiescence's own recursion for it.
 """
 
 import time
@@ -266,6 +282,10 @@ RFP_MARGIN = 90
 STATIC_EVAL_MAX_DEPTH = 6  # max(RFP_MAX_DEPTH, FUTILITY_MAX_DEPTH) -- shared static-eval gate
 LMP_MAX_DEPTH = 4
 LMP_THRESHOLD = np.array([0, 6, 10, 15, 21], dtype=np.int64)
+
+# Fifty-move rule: 100 plies (50 full moves by each side) with no pawn move and no capture is an
+# automatic draw. See this module's docstring for where the running count comes from and why.
+HALFMOVE_DRAW_LIMIT = 100
 
 # Internal iterative deepening: a node deep enough to matter but with no hash move to order by
 # (a TT miss, or a stored entry too shallow to have one -- see hint_from in negamax) gets a
@@ -669,9 +689,13 @@ def negamax(
     counter_promo: np.ndarray,
     parent_from: int,
     parent_to: int,
+    halfmove_clock: int,
 ) -> int:
     counters[0] += 1
     if _time_up(deadline, counters):
+        return 0
+
+    if halfmove_clock >= HALFMOVE_DRAW_LIMIT:
         return 0
 
     h = position_hash(bb, meta)
@@ -764,7 +788,7 @@ def negamax(
             ply + 1, history, child_hist_len,
             tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
             killer_from, killer_to, killer_promo, history_table, False, ext_budget,
-            counter_from, counter_to, counter_promo, -1, -1,
+            counter_from, counter_to, counter_promo, -1, -1, halfmove_clock + 1,
         )
         if counters[1]:
             return 0
@@ -781,7 +805,7 @@ def negamax(
             bb, meta, depth - IID_REDUCTION, alpha, beta, deadline, counters, ply, history,
             hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
             killer_from, killer_to, killer_promo, history_table, allow_null, ext_budget,
-            counter_from, counter_to, counter_promo, parent_from, parent_to,
+            counter_from, counter_to, counter_promo, parent_from, parent_to, halfmove_clock,
         )
         if counters[1]:
             return 0
@@ -819,6 +843,9 @@ def negamax(
     for oi in range(count):
         idx = order[oi]
         f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
+        is_cap = is_capture(bb, meta, f, t)
+        moved_pawn = piece_type_at(bb, meta[0], f) == PAWN
+        child_halfmove_clock = 0 if (is_cap or moved_pawn) else halfmove_clock + 1
         new_bb, new_meta = make_move(bb, meta, f, t, p)
         gives_check = is_check(new_bb, new_meta)
         if ext_budget > 0 and gives_check:
@@ -834,10 +861,10 @@ def negamax(
                 ply + 1, history, child_hist_len,
                 tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                 killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                counter_from, counter_to, counter_promo, f, t,
+                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
             )
         else:
-            if futile and p < 0 and not gives_check and not is_capture(bb, meta, f, t):
+            if futile and p < 0 and not gives_check and not is_cap:
                 # A quiet move at a shallow, non-check node when even the best case (static eval
                 # plus a depth-scaled margin) can't reach alpha -- skip it outright rather than
                 # spend a search on it. oi == 0 (the hash/best-ordered move) is never skipped, so
@@ -850,7 +877,7 @@ def negamax(
                 and p < 0
                 and not in_check
                 and not gives_check
-                and not is_capture(bb, meta, f, t)
+                and not is_cap
             ):
                 # Late move pruning: this far into the ordering at a shallow depth, TT/killer/
                 # history/counter-move ordering has already almost certainly put every move worth
@@ -865,7 +892,7 @@ def negamax(
                 and depth >= LMR_MIN_DEPTH
                 and p < 0
                 and not in_check
-                and not is_capture(bb, meta, f, t)
+                and not is_cap
                 and not gives_check
             ):
                 reduction = LMR_REDUCTION
@@ -875,7 +902,7 @@ def negamax(
                 ply + 1, history, child_hist_len,
                 tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                 killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                counter_from, counter_to, counter_promo, f, t,
+                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
             )
             if not counters[1] and reduction > 0 and score > alpha:
                 # the reduced-depth probe suggested this late, quiet move might actually be
@@ -886,7 +913,7 @@ def negamax(
                     ply + 1, history, child_hist_len,
                     tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                     killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                    counter_from, counter_to, counter_promo, f, t,
+                    counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
                 )
             if not counters[1] and alpha < score < beta:
                 score = -negamax(
@@ -894,7 +921,7 @@ def negamax(
                     ply + 1, history, child_hist_len,
                     tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                     killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                    counter_from, counter_to, counter_promo, f, t,
+                    counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
                 )
         if counters[1]:
             return 0
@@ -1063,6 +1090,7 @@ def _search_root_pass(
     promo_arr: np.ndarray,
     order: np.ndarray,
     count: int,
+    halfmove_clock: int,
 ) -> tuple[int, int, int, int, bool]:
     """One root pass over already-ordered moves within a fixed [alpha, beta] window -- factored
     out of search_root so aspiration windows (see there) can re-run this at the same depth with a
@@ -1074,6 +1102,10 @@ def _search_root_pass(
     for oi in range(count):
         idx = order[oi]
         f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
+        child_halfmove_clock = (
+            0 if (is_capture(bb, meta, f, t) or piece_type_at(bb, meta[0], f) == PAWN)
+            else halfmove_clock + 1
+        )
         new_bb, new_meta = make_move(bb, meta, f, t, p)
         child_depth = depth if is_check(new_bb, new_meta) else depth - 1
         child_ext_budget = MAX_CHECK_EXTENSIONS - (1 if child_depth == depth else 0)
@@ -1082,21 +1114,21 @@ def _search_root_pass(
                 new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters, 1, history,
                 hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                 killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                counter_from, counter_to, counter_promo, f, t,
+                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
             )
         else:
             score = -negamax(
                 new_bb, new_meta, child_depth, -alpha - 1, -alpha, deadline, counters, 1, history,
                 hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                 killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                counter_from, counter_to, counter_promo, f, t,
+                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
             )
             if not counters[1] and alpha < score < beta:
                 score = -negamax(
                     new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters, 1, history,
                     hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                     killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                    counter_from, counter_to, counter_promo, f, t,
+                    counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
                 )
         if counters[1]:
             return best_from, best_to, best_promo, best_score, False
@@ -1142,6 +1174,7 @@ def search_root(
     counter_to: np.ndarray,
     counter_promo: np.ndarray,
     prev_score: int,
+    halfmove_clock: int,
 ) -> tuple[int, int, int, int, bool]:
     """hist_len counts our-turn positions already recorded, including the root's own -- the
     caller (agent.py) writes history[hist_len - 1] = hash(bb, meta) before calling this, since it
@@ -1150,7 +1183,9 @@ def search_root(
     actually played -- see claim_eligible_for_opponent. tt_* / killer_* / history_table /
     counter_* are threaded straight into negamax; see this module's docstring. prev_score is the
     previous iterative-deepening depth's score, or NO_PREV_SCORE if there isn't one (depth 1) --
-    used to center the aspiration window (see module-level constants).
+    used to center the aspiration window (see module-level constants). halfmove_clock is the real
+    game's own fifty-move-rule count (bitboard.halfmove_clock(fen), read by agent.py) -- see this
+    module's docstring's "Fifty-move rule" paragraph.
     """
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     if count == 0:
@@ -1172,7 +1207,7 @@ def search_root(
             tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
             killer_from, killer_to, killer_promo, history_table,
             counter_from, counter_to, counter_promo,
-            from_arr, to_arr, promo_arr, order, count,
+            from_arr, to_arr, promo_arr, order, count, halfmove_clock,
         )
         if not completed:
             return best_from, best_to, best_promo, best_score, False

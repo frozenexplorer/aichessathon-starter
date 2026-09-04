@@ -61,6 +61,16 @@ def from_fen(fen: str) -> tuple[np.ndarray, np.ndarray]:
     return bb, meta
 
 
+def halfmove_clock(fen: str) -> int:
+    """The FEN's own halfmove clock (plies since the last pawn move or capture) -- read directly
+    from the FEN each call rather than tracked incrementally in agent.py, so it is always correct
+    even if a game's starting position (see docs/IDEAS.md: rated games start from curated
+    positions, not necessarily the standard start) does not itself begin at 0. Used for the
+    fifty-move-rule draw detection in search.py -- see its module docstring.
+    """
+    return chess.Board(fen).halfmove_clock
+
+
 _FILES = "abcdefgh"
 
 
