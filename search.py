@@ -125,6 +125,24 @@ move is skipped outright once the static eval plus a depth-scaled margin still c
 search cost is spent on captures/promotions/checks instead. oi == 0 is never skipped, so a node
 this applies to always has at least one fully-searched move to report a real score from.
 
+Reverse futility / static null-move pruning: at a shallow node (depth <= RFP_MAX_DEPTH) not in
+check, if the static eval already clears beta by more than a depth-scaled margin (RFP_MARGIN),
+the whole node returns that eval outright without generating or searching a single move -- the
+opponent's best defense is assumed unable to drag a position this good back down to beta. Shares
+its static-eval computation with futility pruning above (STATIC_EVAL_MAX_DEPTH gates a single
+evaluate() call reused by both, computed at most once per node) since both fire in the same
+shallow-and-not-in-check regime. Distinct target from futility pruning: this prunes the entire
+node before move generation, futility prunes individual moves within a node already being
+searched.
+
+Late move pruning (LMP): inside the move loop, a quiet, non-check move at a shallow node
+(depth <= LMP_MAX_DEPTH) whose position in the ordering (oi) is at or past LMP_THRESHOLD[depth] is
+skipped outright, on the same "ordering has already put anything worth searching ahead of this"
+premise LMR relies on, but pruning entirely rather than searching at reduced depth first. The
+threshold grows with depth, so a more expensive (and more trustworthy) node tolerates more late
+moves before pruning kicks in. Checked after futility pruning's own skip in the same branch, so
+oi == 0 is never reachable here either -- a node always has at least one fully-searched move.
+
 Internal iterative deepening: a node deep enough (IID_MIN_DEPTH) with no hash move to order by --
 a genuine TT miss, not merely an entry too shallow for a cutoff, since that still yields a hint --
 searches itself at depth - IID_REDUCTION purely to populate one before the real move ordering.
@@ -243,6 +261,11 @@ MAX_CHECK_EXTENSIONS = 8
 # move to matter after all. Index 0 is never read (depth <= 0 returns via quiescence earlier).
 FUTILITY_MAX_DEPTH = 3
 FUTILITY_MARGIN = np.array([0, 150, 300, 450], dtype=np.int64)
+RFP_MAX_DEPTH = 6
+RFP_MARGIN = 90
+STATIC_EVAL_MAX_DEPTH = 6  # max(RFP_MAX_DEPTH, FUTILITY_MAX_DEPTH) -- shared static-eval gate
+LMP_MAX_DEPTH = 4
+LMP_THRESHOLD = np.array([0, 6, 10, 15, 21], dtype=np.int64)
 
 # Internal iterative deepening: a node deep enough to matter but with no hash move to order by
 # (a TT miss, or a stored entry too shallow to have one -- see hint_from in negamax) gets a
@@ -702,13 +725,31 @@ def negamax(
 
     in_check = is_check(bb, meta)
 
+    static_eval = 0
+    have_static_eval = False
+    if not in_check and depth <= STATIC_EVAL_MAX_DEPTH:
+        static_eval = evaluate(bb, meta)
+        have_static_eval = True
+
+    if (
+        have_static_eval
+        and depth <= RFP_MAX_DEPTH
+        and -MATE_STORE_THRESHOLD < beta < MATE_STORE_THRESHOLD
+        and static_eval - RFP_MARGIN * depth >= beta
+    ):
+        # Reverse futility / static null-move pruning: the static eval already clears beta by more
+        # than a depth-scaled margin, so even a defense that outplays this crude estimate is
+        # assumed unable to drag the score back down to beta -- return outright rather than search
+        # the node at all. Distinct from futile below, which skips individual moves, not the node.
+        return static_eval
+
     futile = False
     if (
-        depth <= FUTILITY_MAX_DEPTH
-        and not in_check
+        have_static_eval
+        and depth <= FUTILITY_MAX_DEPTH
         and -MATE_STORE_THRESHOLD < alpha < MATE_STORE_THRESHOLD
     ):
-        futile = evaluate(bb, meta) + FUTILITY_MARGIN[depth] <= alpha
+        futile = static_eval + FUTILITY_MARGIN[depth] <= alpha
 
     if (
         allow_null
@@ -801,6 +842,21 @@ def negamax(
                 # plus a depth-scaled margin) can't reach alpha -- skip it outright rather than
                 # spend a search on it. oi == 0 (the hash/best-ordered move) is never skipped, so
                 # this node always has at least one fully-searched move to report a score from.
+                continue
+
+            if (
+                depth <= LMP_MAX_DEPTH
+                and oi >= LMP_THRESHOLD[depth]
+                and p < 0
+                and not in_check
+                and not gives_check
+                and not is_capture(bb, meta, f, t)
+            ):
+                # Late move pruning: this far into the ordering at a shallow depth, TT/killer/
+                # history/counter-move ordering has already almost certainly put every move worth
+                # searching ahead of this one -- skip outright rather than even the reduced-depth
+                # probe LMR below would spend on it. LMP_THRESHOLD grows with depth so a deeper
+                # (more expensive, more trustworthy) node tolerates more late moves before pruning.
                 continue
 
             reduction = 0

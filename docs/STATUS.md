@@ -1,8 +1,8 @@
 # Status
 
-Handoff snapshot as of the Tier 8 pass (2026-09-05), on top of Tier 7, Tier 6, Tier 5, Tier 4,
-Tier 3, Tier 2 (commit `02ec418`), and Tier 1 (commit `12a38f9`), all documented below. Read this
-instead of replaying the whole build history.
+Handoff snapshot as of the Tier 9 pass (2026-09-05), on top of Tiers 1-8 (Tier 2 commit `02ec418`,
+Tier 1 commit `12a38f9`), all documented in their own sections below. Read this instead of
+replaying the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
 08:00-22:00; Daily Five runs 2026-09-06 through 2026-09-10.
 
@@ -37,12 +37,13 @@ evaluate.py     tapered material + PST (midgame/endgame king blend by game phase
                 king safety (attacker-weighted pressure on each king's own ring) -- all jitted
 zobrist.py      position hashing, for repetition detection and the transposition table
 search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table,
-                killer-move + history + counter-move ordering, principal variation search (PVS)
-                with aspiration windows, null-move pruning, late move reductions, check
-                extensions, futility pruning, internal iterative deepening, static exchange
-                evaluation (move ordering + quiescence SEE/delta pruning), quiescence (including
-                a bounded full-width search of check evasions, not just captures, when the side
-                to move is in check), repetition-draw scoring, panic-mode fallback
+                killer-move + history (with malus) + counter-move ordering, principal variation
+                search (PVS) with aspiration windows, null-move pruning, late move reductions and
+                pruning, check extensions, futility and reverse-futility/static-null pruning,
+                internal iterative deepening, static exchange evaluation (move ordering +
+                quiescence SEE/delta pruning), quiescence (including a bounded full-width search
+                of check evasions, not just captures, when the side to move is in check),
+                repetition-draw scoring, panic-mode fallback
 tablebase.py    Syzygy WDL + DTZ, root-only -- WDL filters to won/drawn-safe moves, DTZ narrows
                 further to the ones that actually make progress
 timeman.py      per-move budget (adaptive: a volatile position -- score swinging between
@@ -346,6 +347,36 @@ bearing down on one king's ring (asserted positive, and exactly zero once `phase
 its file-mirrored counterpart onto the other king (asserted to be the exact negation, checking the
 sign convention both ways), and a bare-kings control case (asserted exactly zero).
 
+## Tier 9: what changed and why
+
+Two more pruning layers in `search.py`, on the same "ordering/eval is already trustworthy enough
+to act on without a full search" premise as futility pruning and LMR:
+
+1. **Reverse futility / static null-move pruning** -- at a shallow node (`depth <= RFP_MAX_DEPTH`)
+   not in check, if the static eval already clears beta by more than a depth-scaled margin
+   (`RFP_MARGIN`), the whole node returns that eval outright, before move generation -- the
+   opponent's best defense is assumed unable to drag a position this good back down to beta.
+   Different target from the existing futility pruning below it: this prunes the entire node,
+   futility prunes individual moves inside a node already being searched. Shares its static-eval
+   computation with futility pruning (`STATIC_EVAL_MAX_DEPTH` gates a single `evaluate()` call
+   reused by both, computed at most once per node, replacing what were two separate calls before).
+2. **Late move pruning (LMP)** -- inside the move loop, a quiet, non-check move at a shallow node
+   (`depth <= LMP_MAX_DEPTH`) whose position in the ordering has reached `LMP_THRESHOLD[depth]` is
+   skipped outright rather than even given LMR's reduced-depth probe, on the premise that ordering
+   has already put anything worth searching ahead of it. Threshold grows with depth, so a more
+   expensive (and more trustworthy) node tolerates more late moves before pruning. `oi == 0` stays
+   unreachable here, same guarantee futility pruning already gives -- a node always has at least
+   one fully-searched move to report a real score from.
+
+No new dedicated test: both are heuristic pruning (can, rarely, discard a real line -- the
+accepted tradeoff every pruning technique in this engine already makes, from null-move pruning
+onward), not correctness changes, so covered by the existing full gate plus functional games.
+Substantial depth gain on the Tier 1 blunder-position FEN: an 8s search that previously reached
+depth 6 complete / depth 7 partial (Tier 8: 182K nodes) now reaches **depth 8 complete / depth 9
+partial** with far fewer nodes per depth (e.g. depth 7: 90K nodes vs. Tier 8's depth-7-partial
+182K) -- the two prunes compounding with the existing futility/null-move/LMR stack rather than
+duplicating their effect.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -397,6 +428,11 @@ sign convention both ways), and a bare-kings control case (asserted exactly zero
   in-process games. Same 8s-search throughput check reached depth 6 complete faster than Tier 7
   (2.80s vs. 4.30s) and depth 7 partial with more nodes (182K) -- no regression, within normal
   run-to-run variance from eval-driven pruning decisions shifting slightly.
+- Tier 9: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks, threats,
+  quiescence-check, king-safety) all clean, plus the same functional in-process games. Same
+  8s-search throughput check reached depth 8 complete / depth 9 partial, a real jump from Tier 8's
+  depth 6 complete / depth 7 partial, with far fewer nodes per depth (e.g. depth 7: 90K vs. Tier
+  8's depth-7-partial 182K) -- the two new prunes compounding with the existing stack as intended.
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -471,10 +507,14 @@ see the Tier 6 section above. From the same "further ideas" discussion: history 
 quiet moves that fail to cause a cutoff, not just reward the ones that do) and a king-safety eval
 term (attacker count/weight near the enemy king, not just the existing pawn-shield bonus) are
 next in line if picked back up, then reverse futility/static-null pruning, late move pruning, and
-singular extensions as further search-side levers. Tier 7 (history malus) and Tier 8 (king safety)
-picked up both of those -- see their sections above. Next up if continuing this list: reverse
-futility/static-null pruning, late move pruning, then singular extensions (higher risk/effort,
-interacts with the existing extension budget). Still not picked up: generating a small custom
-endgame tablebase locally via retrograde analysis instead of downloading one (item 8's blocker) --
-multi-day scope, not worth it against the time remaining
-unless everything else is done early.
+singular extensions as further search-side levers. Tier 7 (history malus), Tier 8 (king safety),
+and Tier 9 (reverse futility/static-null pruning, late move pruning) picked up everything on that
+list except singular extensions -- see their sections above. Singular extensions is next if
+continuing this list (higher risk/effort, interacts with the existing extension budget), alongside
+two correctness/robustness gaps raised in the same discussion: fifty-move-rule and
+insufficient-material draw detection inside search (currently absent -- tablebase probing is
+root-only, so internal search nodes have no such awareness), and a move-overhead safety margin in
+`timeman.py` for real subprocess/IO latency in competition play. Still not picked up: generating a
+small custom endgame tablebase locally via retrograde analysis instead of downloading one (item
+8's blocker) -- multi-day scope, not worth it against the time remaining unless everything else is
+done early.
