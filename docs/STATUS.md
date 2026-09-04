@@ -1,6 +1,6 @@
 # Status
 
-Handoff snapshot as of the Tier 12 pass (2026-09-05), on top of Tiers 1-11 (Tier 2 commit
+Handoff snapshot as of the Tier 13 pass (2026-09-05), on top of Tiers 1-12 (Tier 2 commit
 `02ec418`, Tier 1 commit `12a38f9`), all documented in their own sections below. Read this instead
 of replaying the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
@@ -14,9 +14,9 @@ with the full correctness gate (`ruff`, `mypy --strict`, `tests/perft.py`,
 `tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`, from Tier 5 onward
 `tests/test_threats.py`, from Tier 6 onward `tests/test_quiescence_check.py`, from Tier 8 onward
 `tests/test_king_safety.py`, from Tier 10 onward `tests/test_fifty_move.py`, from Tier 11 onward
-`tests/test_insufficient_material.py`, and from Tier 12 onward `tests/test_timeman.py`) plus
-functional games (checkmates from the start position and the KBN-vs-K tablebase endgame, both
-colours) before moving to the next.
+`tests/test_insufficient_material.py`, from Tier 12 onward `tests/test_timeman.py`, and from
+Tier 13 onward `tests/test_singular_extension.py`) plus functional games (checkmates from the
+start position and the KBN-vs-K tablebase endgame, both colours) before moving to the next.
 
 ## Architecture
 
@@ -42,11 +42,12 @@ zobrist.py      position hashing, for repetition detection and the transposition
 search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table,
                 killer-move + history (with malus) + counter-move ordering, principal variation
                 search (PVS) with aspiration windows, null-move pruning, late move reductions and
-                pruning, check extensions, futility and reverse-futility/static-null pruning,
-                internal iterative deepening, static exchange evaluation (move ordering +
-                quiescence SEE/delta pruning), quiescence (including a bounded full-width search
-                of check evasions, not just captures, when the side to move is in check),
-                repetition-draw scoring, panic-mode fallback
+                pruning, check extensions, singular extensions (excluded-move verification
+                search), futility and reverse-futility/static-null pruning, internal iterative
+                deepening, static exchange evaluation (move ordering + quiescence SEE/delta
+                pruning), quiescence (including a bounded full-width search of check evasions, not
+                just captures, when the side to move is in check), repetition/fifty-move/
+                insufficient-material draw scoring, panic-mode fallback
 tablebase.py    Syzygy WDL + DTZ, root-only -- WDL filters to won/drawn-safe moves, DTZ narrows
                 further to the ones that actually make progress
 timeman.py      per-move budget (adaptive: a volatile position -- score swinging between
@@ -74,6 +75,10 @@ tests/test_insufficient_material.py  is_insufficient_material and negamax's use 
                               recognised dead-draw shapes, three deliberately-unflagged ones
 tests/test_timeman.py        budget_ms/extended_budget_ms's two stacked safety reservations, and
                               sane, non-negative output at very low clock values
+tests/test_singular_extension.py  negamax's excluded-move mechanism: an excluded search still
+                              returns a sane score and never stores to the TT under its own
+                              position's key, while its own real-move children still store to
+                              theirs normally
 ```
 
 Everything under `weights/syzygy/` and every `.py` file above ships in the zip (`make zip`);
@@ -462,6 +467,50 @@ New dedicated test: `tests/test_timeman.py` (this module had none before) -- con
 and that both stay sane (floor at `MIN_BUDGET_MS`, never negative) across a range of very low
 clock values.
 
+## Tier 13: what changed and why
+
+1. **Singular extensions** (`search.py`) -- the last, highest-risk item from the "further ideas"
+   discussion, done last and most carefully for exactly that reason. At a deep enough node
+   (`SE_MIN_DEPTH`) with a hash move backed by a deep, trustworthy TT entry (`SE_TT_DEPTH_MARGIN`,
+   not merely an upper bound), a verification search of this exact node's *other* moves -- at
+   `(depth - 1) // 2`, in a narrow window just below the hash move's own stored score
+   (`SE_MARGIN_PER_DEPTH * depth`) -- checks whether any alternative can even come close. If none
+   can, the hash move is "singular" and its own child gets the same one-ply extension a checking
+   move already gets from search extensions, since the search is now committing real depth to
+   confirming a move the ordering already trusts rather than assuming that trust is warranted.
+   Implemented via two new `negamax` parameters, `excluded_from`/`excluded_to`: a per-node
+   exclusion, never inherited by any recursive call the excluded search itself makes (its own
+   null-move, IID, and move-loop children all pass `-1, -1`, identical to every ordinary node), so
+   nesting is impossible by construction -- the trigger condition also independently requires
+   `excluded_from < 0`, belt and braces. The two places this needed real care, both handled: an
+   excluded node must never resolve via its own TT entry (written for the *whole* move set, not
+   the one this search is deliberately missing) -- the early-return in `_tt_resolve`'s caller is
+   skipped whenever `excluded_from >= 0`, though `hint_from`/`hint_to` are still read for ordering,
+   since the loop's own exclusion check (`continue` on a from/to match) makes that harmless; and an
+   excluded node must never write one either, since a partial-search result stored under the full
+   position's key would corrupt every future non-excluded probe of it -- skipped by wrapping the
+   entire end-of-function store in the same `excluded_from < 0` guard.
+
+Measured cost: a fixed 8s search on the Tier 1 blunder-position FEN now reaches depth 7 complete
+(89971 nodes, essentially identical to every prior tier's depth-7 count) but only depth 8 partial
+(107648 nodes) rather than Tier 12's depth 8 complete (~95-107K nodes) / depth 9 partial -- a real,
+measured throughput cost from the extra verification searches at qualifying nodes, not a
+measurement artifact. This is the expected, accepted tradeoff the technique is known for in real
+engines: real playing strength from singular extensions comes from tactical accuracy on critical
+lines the verification search actually catches, not from raw nodes/sec, which is exactly why this
+item was scoped, implemented, and tested more carefully than anything else in this list rather
+than skipped for its cost alone.
+
+New dedicated test: `tests/test_singular_extension.py` -- directly exercises the exclusion
+mechanism itself (not the singularity heuristic's tuning, which nothing asserts on): a baseline
+unexcluded search populates its own TT normally; excluding one real, always-legal move (a king
+step) still returns a sane material-edge score by searching everything else; and, most
+importantly, the excluded search never writes to the TT under its own position's key while its own
+real-move children (different positions, reached normally) still write to theirs -- caught a real
+bug in the test itself during development (an earlier draft asserted nothing was written anywhere,
+which is wrong: children legitimately write under their own keys) before the assertion was
+narrowed to the actual invariant that matters.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -534,6 +583,12 @@ clock values.
   constant change, not a search-algorithm one, so the 8s-search throughput check does not apply
   here -- functional games exercising the real `agent.get_move` path, which is the only consumer
   of `timeman.budget_ms`/`extended_budget_ms`, is the relevant check).
+- Tier 13: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks, threats,
+  quiescence-check, king-safety, fifty-move, insufficient-material, timeman) plus the new
+  `tests/test_singular_extension.py` all clean, plus the same functional in-process games (no
+  crashes, no hangs, checkmates both colours -- meaningful here specifically, since a bug in the
+  exclusion/recursion-termination logic could plausibly manifest as a hang rather than a wrong
+  score). 8s-search throughput check shows a real, measured cost -- see the Tier 13 section above.
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -619,7 +674,8 @@ root-only, so internal search nodes have no such awareness), and a move-overhead
 Tier 11 (insufficient material) picked up both draw-detection gaps -- see their sections above.
 Tier 12 (move-overhead safety margin) picked that up too -- see its section above. Singular
 extensions is the last item from that discussion, and the highest-risk one (interacts with the
-existing extension budget) -- see its own section below once picked up. Still not picked up:
-generating a small custom endgame tablebase locally via retrograde analysis instead of downloading
-one (item 8's blocker) -- multi-day scope, not worth it against the time remaining unless
-everything else is done early.
+existing extension budget) -- Tier 13 picked it up, done last and most carefully of everything on
+this list; see its own section above. That closes out every item raised in the "further ideas"
+discussion. Still not picked up: generating a small custom endgame tablebase locally via
+retrograde analysis instead of downloading one (item 8's blocker) -- multi-day scope, not worth it
+against the time remaining unless everything else is done early.

@@ -223,7 +223,7 @@ def _search_restricted(
                 new_bb, new_meta, depth - 1, -sr.INF, sr.INF, deadline, counters, 1, _history,
                 hist_len, _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
                 killer_from, killer_to, killer_promo, history_table, True, sr.MAX_CHECK_EXTENSIONS,
-                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
+                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
             )
             if counters[1]:
                 break
