@@ -29,6 +29,15 @@ the enemy king -- at once, since the opponent can only save one) and `pin_and_xr
 along the same ray from one of our sliders). Both recompute the ray with a candidate blocker
 removed rather than tracking rays incrementally, the same "discovered attacker falls out for free"
 trick `search.see` already relies on for the same reason.
+
+One more, `king_safety_score`: attacker-weighted pressure on each king's own ring (the up-to-eight
+squares immediately around it) -- the gap between "material is fine" and "about to get mated" that
+material/PST/mobility/threats scoring alone under-values until a search reads all the way to the
+mating net itself, previously covered only by the pawn-shield bonus above (which values a king's
+own cover, not the enemy's actual reach toward it). Phase-blended the opposite way from the
+passed-pawn/king-distance terms: full strength with pieces still on the board to attack with,
+fading to zero in the endgame, where an exposed king stops being a liability and becomes an asset
+(the king PST's own phase blend already covers that side of it).
 """
 
 import numpy as np
@@ -145,6 +154,7 @@ FORK_BONUS = np.int32(30)
 PIN_KING_DIVISOR = np.int32(6)
 XRAY_FLAT_BONUS = np.int32(6)
 XRAY_HEAVY_DIVISOR = np.int32(10)
+KING_ZONE_ATTACK_WEIGHT = np.array([2, 20, 20, 30, 45, 0], dtype=np.int32)
 
 
 def _build_file_masks() -> np.ndarray:
@@ -556,6 +566,57 @@ def pin_and_xray_score(bb: np.ndarray) -> int:
 
 
 @njit(cache=False)
+def king_safety_score(bb: np.ndarray, phase: int) -> int:
+    """Attacker-weighted pressure on each king's own ring (KING_ATTACKS[king_sq], its up-to-eight
+    adjacent squares): for each enemy piece, how many of those squares it currently attacks,
+    weighted per piece type (a queen's reach into the ring is far more dangerous than a knight's).
+    Phase-blended like the king PST -- full strength with material still on the board to attack
+    with, zero once phase hits 0. King itself excluded as an attacker (kings do not approach the
+    enemy king in the phases this term is active for) and as a target weight (KING_ZONE_ATTACK_
+    WEIGHT[KING] == 0, since only the opponent's non-king pieces threatening the ring matter here).
+    """
+    if phase == 0:
+        return 0
+    score = np.int32(0)
+    white_occ = occ_color(bb, WHITE)
+    black_occ = occ_color(bb, BLACK)
+    all_occ = white_occ | black_occ
+
+    for color in range(2):
+        sign = np.int32(1) if color == WHITE else np.int32(-1)
+        enemy = 1 - color
+        zone = KING_ATTACKS[king_square(bb, enemy)]
+        danger = np.int32(0)
+
+        remaining = bb[color * 6 + PAWN]
+        while remaining:
+            sq = _bit_scan(remaining)
+            remaining &= remaining - ONE
+            hits = _popcount64(PAWN_ATTACKS[color, sq] & zone)
+            danger += KING_ZONE_ATTACK_WEIGHT[PAWN] * np.int32(hits)
+
+        for pt in (KNIGHT, BISHOP, ROOK, QUEEN):
+            remaining = bb[color * 6 + pt]
+            while remaining:
+                sq = _bit_scan(remaining)
+                remaining &= remaining - ONE
+                if pt == KNIGHT:
+                    atk = KNIGHT_ATTACKS[sq]
+                elif pt == BISHOP:
+                    atk = bishop_attacks(sq, all_occ)
+                elif pt == ROOK:
+                    atk = rook_attacks(sq, all_occ)
+                else:
+                    atk = queen_attacks(sq, all_occ)
+                hits = _popcount64(atk & zone)
+                danger += KING_ZONE_ATTACK_WEIGHT[pt] * np.int32(hits)
+
+        score += sign * (danger * np.int32(phase) // np.int32(PHASE_MAX))
+
+    return int(score)
+
+
+@njit(cache=False)
 def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
     phase = game_phase(bb)
     score = (
@@ -566,6 +627,7 @@ def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
         + passed_pawn_king_distance(bb, phase)
         + threats_score(bb)
         + pin_and_xray_score(bb)
+        + king_safety_score(bb, phase)
     )
     return int(score) if meta[0] == WHITE else int(-score)
 

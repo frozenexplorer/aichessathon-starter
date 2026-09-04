@@ -1,8 +1,8 @@
 # Status
 
-Handoff snapshot as of the Tier 7 pass (2026-09-05), on top of Tier 6, Tier 5, Tier 4, Tier 3,
-Tier 2 (commit `02ec418`), and Tier 1 (commit `12a38f9`), all documented below. Read this instead
-of replaying the whole build history.
+Handoff snapshot as of the Tier 8 pass (2026-09-05), on top of Tier 7, Tier 6, Tier 5, Tier 4,
+Tier 3, Tier 2 (commit `02ec418`), and Tier 1 (commit `12a38f9`), all documented below. Read this
+instead of replaying the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
 08:00-22:00; Daily Five runs 2026-09-06 through 2026-09-10.
 
@@ -33,8 +33,8 @@ evaluate.py     tapered material + PST (midgame/endgame king blend by game phase
                 structure (doubled/isolated/passed, the passed-pawn bonus itself phase-blended),
                 bishop pair, rook open/semi-open files, king pawn-shield, differential piece
                 mobility, king proximity to passed-pawn promotion squares, tactical threat
-                awareness (hanging pieces, pawn threats, forks, absolute pins, x-rays/skewers) --
-                all jitted
+                awareness (hanging pieces, pawn threats, forks, absolute pins, x-rays/skewers),
+                king safety (attacker-weighted pressure on each king's own ring) -- all jitted
 zobrist.py      position hashing, for repetition detection and the transposition table
 search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table,
                 killer-move + history + counter-move ordering, principal variation search (PVS)
@@ -61,6 +61,8 @@ tests/test_threats.py        fork/hanging-piece/pin/x-ray eval terms against han
                               threats_score/pin_and_xray_score directly
 tests/test_quiescence_check.py  quiescence's in-check evasion search against an old-vs-fixed
                               check_budget comparison, plus a genuine checkmate control case
+tests/test_king_safety.py    king_safety_score against a hand-built king-ring-pressure position,
+                              its sign-mirrored counterpart, a phase-0 fade-out, and a quiet control
 ```
 
 Everything under `weights/syzygy/` and every `.py` file above ships in the zip (`make zip`);
@@ -325,6 +327,25 @@ in), so it is covered by the existing full gate plus functional games rather tha
 A fixed 8s search on the Tier 1 blunder-position FEN reached the same depth 6 complete / depth 7
 partial as Tier 6 (127K nodes, consistent with normal run-to-run variance) -- no regression.
 
+## Tier 8: what changed and why
+
+1. **King safety eval term** (`evaluate.py`, `king_safety_score`) -- the only existing king-safety
+   signal was the pawn-shield bonus (a king's own cover), with nothing valuing how much of the
+   enemy's actual reach lands on the squares around each king. Added: for every enemy non-king
+   piece, how many squares of the king's own ring (`KING_ATTACKS[king_sq]`, its up-to-eight
+   neighbours) it currently attacks, weighted per piece type (`KING_ZONE_ATTACK_WEIGHT` -- a queen
+   in the ring is far more dangerous than a knight), phase-blended like the king PST so it carries
+   full weight with material on the board to attack with and fades to exactly zero at phase 0 (an
+   exposed king in a bare endgame is an asset, not a liability -- the king PST's own blend already
+   covers that side of it). Deliberately linear in attacker count rather than a nonlinear
+   safety-table lookup (as e.g. Stockfish's classical eval used) to keep the addition small and
+   low-risk; a nonlinear table is a plausible later refinement if there's time to tune it properly.
+
+New dedicated test: `tests/test_king_safety.py` -- a hand-built position with a queen and rook
+bearing down on one king's ring (asserted positive, and exactly zero once `phase` is forced to 0),
+its file-mirrored counterpart onto the other king (asserted to be the exact negation, checking the
+sign convention both ways), and a bare-kings control case (asserted exactly zero).
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -371,6 +392,11 @@ partial as Tier 6 (127K nodes, consistent with normal run-to-run variance) -- no
 - Tier 7: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks, threats,
   quiescence-check) all clean, plus the same functional in-process games. Same 8s-search
   throughput check as Tier 6, unaffected (depth 6 complete / depth 7 partial, 127K nodes).
+- Tier 8: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks, threats,
+  quiescence-check) plus the new `tests/test_king_safety.py` all clean, plus the same functional
+  in-process games. Same 8s-search throughput check reached depth 6 complete faster than Tier 7
+  (2.80s vs. 4.30s) and depth 7 partial with more nodes (182K) -- no regression, within normal
+  run-to-run variance from eval-driven pruning decisions shifting slightly.
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -445,8 +471,10 @@ see the Tier 6 section above. From the same "further ideas" discussion: history 
 quiet moves that fail to cause a cutoff, not just reward the ones that do) and a king-safety eval
 term (attacker count/weight near the enemy king, not just the existing pawn-shield bonus) are
 next in line if picked back up, then reverse futility/static-null pruning, late move pruning, and
-singular extensions as further search-side levers. Tier 7 (history malus) picked up the first of
-those two -- see the Tier 7 section above; the king-safety eval term is still open. Still not
-picked up: generating a small custom endgame tablebase locally via retrograde analysis instead of
-downloading one (item 8's blocker) -- multi-day scope, not worth it against the time remaining
+singular extensions as further search-side levers. Tier 7 (history malus) and Tier 8 (king safety)
+picked up both of those -- see their sections above. Next up if continuing this list: reverse
+futility/static-null pruning, late move pruning, then singular extensions (higher risk/effort,
+interacts with the existing extension budget). Still not picked up: generating a small custom
+endgame tablebase locally via retrograde analysis instead of downloading one (item 8's blocker) --
+multi-day scope, not worth it against the time remaining
 unless everything else is done early.
