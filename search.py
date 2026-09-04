@@ -16,6 +16,19 @@ Below timeman.PANIC_MS remaining, agent.py skips the tree search altogether and 
 quick_best_move instead: even a depth-1 search can cascade through thousands of quiescence
 nodes on a tactical position before the first check point, and at a few tens of milliseconds of
 clock left that alone can be enough to flag. quick_best_move never recurses, so it cannot.
+
+Repetition: negamax and search_root take a shared `history` array of zobrist hashes plus
+`hist_len`, the count of entries that precede the current node. get_move only ever sees
+positions where it is our own turn, and a real repeating shuffle shows up on both sides in
+lockstep, so only our-turn positions (even ply, root = ply 0) are ever recorded or checked --
+the array is indexed by "how many our-turn positions have occurred so far on the current path",
+which a plain depth-first walk keeps correct with no explicit push/pop: a node writes its own
+slot once, and a later sibling at the same ply simply overwrites it when the search backtracks.
+agent.py owns the persistent real-game prefix and writes the root's own slot before calling
+search_root; everything at ply >= 1 is written by negamax itself as it descends. If a line would
+make a position recur a third time, it scores as an immediate draw (0) instead of running eval
+or search on it further -- alpha-beta then avoids it on its own when winning (0 loses to a
+positive score) and walks into it when losing (0 beats a negative one).
 """
 
 import time
@@ -26,12 +39,17 @@ from numba import njit, objmode
 from bitboard import PAWN, QUEEN
 from evaluate import PIECE_VALUE, evaluate
 from movegen import generate_legal, is_check, make_move, piece_type_at
+from zobrist import position_hash
 
 MATE = 1_000_000
 INF = 2_000_000
 CHECK_INTERVAL = 127
 QUIESCENCE_MAX_PLIES = 24
 ONE = np.uint64(1)
+
+# Our-turn positions per game are bounded by rules.PLY_CAP / 2 (~150); in-search growth is
+# bounded by MAX_DEPTH / 2 (agent.py caps depth at 64, so ~32 more). 512 leaves ample headroom.
+HISTORY_CAPACITY = 512
 
 
 @njit(cache=False)
@@ -165,10 +183,26 @@ def negamax(
     beta: int,
     deadline: float,
     counters: np.ndarray,
+    ply: int,
+    history: np.ndarray,
+    hist_len: int,
 ) -> int:
     counters[0] += 1
     if _time_up(deadline, counters):
         return 0
+
+    if ply % 2 == 0:
+        h = position_hash(bb, meta)
+        matches = 0
+        for i in range(hist_len):
+            if history[i] == h:
+                matches += 1
+        if matches >= 2:
+            return 0
+        history[hist_len] = h
+        child_hist_len = hist_len + 1
+    else:
+        child_hist_len = hist_len
 
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     if count == 0:
@@ -185,7 +219,10 @@ def negamax(
         idx = order[oi]
         f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
         new_bb, new_meta = make_move(bb, meta, f, t, p)
-        score = -negamax(new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters)
+        score = -negamax(
+            new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters,
+            ply + 1, history, child_hist_len,
+        )
         if counters[1]:
             return 0
         if score > best:
@@ -207,7 +244,13 @@ def search_root(
     pv_from: int,
     pv_to: int,
     pv_promo: int,
+    history: np.ndarray,
+    hist_len: int,
 ) -> tuple[int, int, int, int, bool]:
+    """hist_len counts our-turn positions already recorded, including the root's own -- the
+    caller (agent.py) writes history[hist_len - 1] = hash(bb, meta) before calling this, since it
+    already needs that hash for the persistent cross-move history anyway.
+    """
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     if count == 0:
         return -1, -1, -1, 0, False
@@ -224,7 +267,9 @@ def search_root(
         idx = order[oi]
         f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
         new_bb, new_meta = make_move(bb, meta, f, t, p)
-        score = -negamax(new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters)
+        score = -negamax(
+            new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters, 1, history, hist_len
+        )
         if counters[1]:
             return best_from, best_to, best_promo, best_score, False
         if score > best_score:
