@@ -19,12 +19,21 @@ anything on our side of the board. One appended per move we actually play (not e
 search, since only the real, played sequence matters for what has actually occurred) -- so it
 grows at exactly the same rate as _history and is bounded the same way.
 
-Once few enough pieces remain, tablebase.best_moves narrows the root to WDL-optimal candidates
-(see tablebase.py) and _search_restricted picks among just those with the normal search -- still
-eval- and repetition-aware, just guaranteed never to concede a win or a drawable position once
-the tablebase has a definitive read. Any failure there (missing files, a position out of range)
-returns None and this falls straight back to the unrestricted search below, so a bug in the
-tablebase path can only cost the optimization, never the game.
+Once few enough pieces remain, tablebase.best_moves narrows the root to WDL/DTZ-optimal
+candidates (see tablebase.py) and _search_restricted picks among just those with the normal
+search -- still eval- and repetition-aware, just guaranteed never to concede a win or a drawable
+position once the tablebase has a definitive read. Any failure there (missing files, a position
+out of range) returns None and this falls straight back to the unrestricted search below, so a
+bug in the tablebase path can only cost the optimization, never the game.
+
+_tt_*: the transposition table (search.py), a fixed-size array-based hash table. Persists across
+the whole game like the history arrays above, since positions can transpose across our own move
+choices even without repeating outright -- but unlike them, it never affects correctness: a stale
+or colliding entry can only cost some search accuracy, never mask a real repetition (negamax
+checks that first and never touches the table for a forced-draw node) or destabilize the
+claim-eligibility safety net above (which never consults it at all). Killer moves and the
+from/to history table are cheap move-ordering aids that encode this search's own cutoff history,
+not the position, so they are rebuilt fresh every call rather than carried across moves.
 """
 
 import time
@@ -45,6 +54,8 @@ _history = np.zeros(sr.HISTORY_CAPACITY, dtype=np.uint64)
 _history_len = 0
 _opponent_history = np.zeros(sr.HISTORY_CAPACITY, dtype=np.uint64)
 _opponent_history_len = 0
+
+(_tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo) = sr.new_tt()
 
 
 def get_move(fen: str, time_left_ms: int) -> str:
@@ -86,9 +97,14 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
     deadline = start + timeman.budget_ms(time_left_ms) / 1000.0
     hist_len = _history_len + 1
+    killer_from, killer_to, killer_promo = sr.new_killers()
+    history_table = sr.new_history_table()
 
     if allowed:
-        best_from, best_to, best_promo = _search_restricted(bb, meta, allowed, deadline, hist_len)
+        best_from, best_to, best_promo = _search_restricted(
+            bb, meta, allowed, deadline, hist_len, killer_from, killer_to, killer_promo,
+            history_table,
+        )
     else:
         pv_from, pv_to, pv_promo = -1, -1, -1
         depth = 1
@@ -97,6 +113,8 @@ def get_move(fen: str, time_left_ms: int) -> str:
             f, t, p, score, completed = sr.search_root(
                 bb, meta, depth, deadline, counters, pv_from, pv_to, pv_promo,
                 _history, hist_len, _opponent_history, _opponent_history_len,
+                _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
+                killer_from, killer_to, killer_promo, history_table,
             )
             if f != -1:
                 best_from, best_to, best_promo = int(f), int(t), int(p)
@@ -133,8 +151,12 @@ def _search_restricted(
     moves: list[tuple[int, int, int]],
     deadline: float,
     hist_len: int,
+    killer_from: np.ndarray,
+    killer_to: np.ndarray,
+    killer_promo: np.ndarray,
+    history_table: np.ndarray,
 ) -> tuple[int, int, int]:
-    """Iterative deepening restricted to `moves` (already filtered to WDL-optimal by the
+    """Iterative deepening restricted to `moves` (already filtered to WDL/DTZ-optimal by the
     tablebase) -- same shape as the main loop, just over a smaller candidate set, so eval and
     repetition-avoidance still pick the move that actually makes progress toward mate.
     """
@@ -148,7 +170,8 @@ def _search_restricted(
             new_bb, new_meta = mg.make_move(bb, meta, f, t, p)
             score = -sr.negamax(
                 new_bb, new_meta, depth - 1, -sr.INF, sr.INF, deadline, counters, 1, _history,
-                hist_len,
+                hist_len, _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
+                killer_from, killer_to, killer_promo, history_table,
             )
             if counters[1]:
                 break
@@ -177,7 +200,13 @@ def _warm_up() -> None:
     history = np.zeros(sr.HISTORY_CAPACITY, dtype=np.uint64)
     history[0] = zb.position_hash(bb, meta)
     opponent_history = np.zeros(sr.HISTORY_CAPACITY, dtype=np.uint64)
-    sr.search_root(bb, meta, 2, deadline, counters, -1, -1, -1, history, 1, opponent_history, 0)
+    killer_from, killer_to, killer_promo = sr.new_killers()
+    history_table = sr.new_history_table()
+    sr.search_root(
+        bb, meta, 2, deadline, counters, -1, -1, -1, history, 1, opponent_history, 0,
+        _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
+        killer_from, killer_to, killer_promo, history_table,
+    )
     from_arr, to_arr, promo_arr, count = mg.generate_legal(bb, meta)
     sr.quick_best_move(bb, meta, from_arr, to_arr, promo_arr, count)
     new_bb, new_meta = mg.make_move(bb, meta, int(from_arr[0]), int(to_arr[0]), int(promo_arr[0]))

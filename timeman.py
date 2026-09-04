@@ -3,7 +3,7 @@ number here leans conservative rather than clever.
 """
 
 SAFETY_MARGIN_MS = 300
-MIN_BUDGET_MS = 30
+MIN_BUDGET_MS = 5
 ASSUMED_MOVES_LEFT = 30
 INCREMENT_MS = 500
 

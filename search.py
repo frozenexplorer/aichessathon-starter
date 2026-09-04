@@ -1,9 +1,5 @@
-"""Negamax with alpha-beta, iterative deepening, MVV-LVA move ordering and quiescence search.
-
-No transposition table yet -- deliberately cut for the first working version under time
-pressure. Ordering (root PV move first, then MVV-LVA captures) and quiescence are the pieces
-that matter most at Python-scale node counts, per docs/IDEAS.md, and a TT is a safe fast-follow
-once this is proven correct and robust.
+"""Negamax with alpha-beta, iterative deepening, a transposition table, killer/history move
+ordering, principal variation search (PVS), and quiescence search.
 
 Time safety: numba cannot call time.perf_counter() directly in nopython mode, so the search
 drops back to Python via `objmode` every 128 nodes to check a wall-clock deadline. On abort it
@@ -17,6 +13,30 @@ quick_best_move instead: even a depth-1 search can cascade through thousands of 
 nodes on a tactical position before the first check point, and at a few tens of milliseconds of
 clock left that alone can be enough to flag. quick_best_move never recurses, so it cannot.
 
+Transposition table: a fixed-size, always-replace hash table (parallel numpy arrays, not a dict
+-- numba nopython mode has no fast Python dict), keyed on the low bits of the Zobrist hash with a
+full 64-bit key comparison to detect index collisions. Stores a depth, a score (bound-adjusted
+for mate distance so a cached "mate in N from here" is still correct when reused at a different
+ply), a bound type (exact/lower/upper), and the best move found, so a re-visited node can either
+return immediately (sufficient stored depth, exact bound, or a bound that already causes a
+cutoff) or at minimum reuse the stored move as the first one tried. Persists across the whole
+game (agent.py owns the arrays, created once), since positions can transpose across our own
+move choices even when they don't recur outright. It is deliberately not consulted for the
+repetition-forced draw score (see below) -- that check runs first and returns before the table
+is ever read or written for that node, so a cached score can never paper over an actual repeat.
+
+Killer moves (two per ply) and a from/to history table give cheap move ordering for quiet moves
+that caused a beta cutoff elsewhere in the tree, on top of the hash-move-first, then MVV-LVA
+capture ordering already in place. Both are rebuilt fresh per real move decision (agent.py
+allocates them per get_move call), since they encode this search's own cutoff history, not
+anything about the position itself.
+
+Principal variation search: the first move at each node (hash move or best-scoring by ordering)
+is searched with the full alpha-beta window; every other move first gets a cheap null-window
+probe (-alpha-1, -alpha) and is only re-searched with the full window if that probe suggests it
+might actually beat alpha. Cuts the cost of nodes that ordering already got right, which the
+hash-move-first and killer/history ordering above make the common case.
+
 Repetition, mechanism 1 -- our own turn recurring: negamax and search_root take a shared
 `history` array of zobrist hashes plus `hist_len`, the count of entries that precede the current
 node. Only our-turn positions (even ply, root = ply 0) are ever recorded or checked here -- the
@@ -26,7 +46,9 @@ slot once, and a later sibling at the same ply simply overwrites it when the sea
 agent.py owns the persistent real-game prefix and writes the root's own slot before calling
 search_root; everything at ply >= 1 is written by negamax itself as it descends. If a line would
 make a position recur a third time, it scores as an immediate draw (0) instead of running eval
-or search on it further.
+or search on it further -- and this check runs before the transposition table is touched, so a
+position that is genuinely a repeat on this path is never short-circuited by a stale cached score
+from a path where it wasn't.
 
 That alone is not sufficient, for two separate reasons, both found by a won game that kept
 drawing (see agent.py's module docstring for the two real games). First: the harness's referee
@@ -45,7 +67,8 @@ position we would hand over, matching each of the opponent's replies against `hi
 way, search_root / agent._search_restricted cap that candidate move's score at 0, so a move that
 merely offers the position is treated the same as one that plays it. Root-only, not inside
 negamax's own recursion: condition one is a full extra movegen per candidate move, affordable
-once per real move decision but not throughout the tree.
+once per real move decision but not throughout the tree. Untouched by the transposition table --
+it always recomputes from the real history arrays, never from a cached score.
 """
 
 import time
@@ -67,6 +90,20 @@ ONE = np.uint64(1)
 # Our-turn positions per game are bounded by rules.PLY_CAP / 2 (~150); in-search growth is
 # bounded by MAX_DEPTH / 2 (agent.py caps depth at 64, so ~32 more). 512 leaves ample headroom.
 HISTORY_CAPACITY = 512
+
+# Negamax's own recursion only deepens through ply while depth > 0, and depth only ever
+# decreases from the root's initial value (agent.py caps that at 64), so 128 is ample headroom
+# for indexing killer moves by ply, matching HISTORY_CAPACITY's own margin above its real need.
+MAX_KILLER_PLY = 128
+
+# ~1M entries * 20 bytes/entry (parallel arrays below) is a fixed ~20MB, independent of game
+# length -- always-replace, no growth, no eviction bookkeeping.
+TT_SIZE = 1 << 20
+TT_MASK = np.uint64(TT_SIZE - 1)
+TT_EXACT = np.int8(0)
+TT_LOWER = np.int8(1)
+TT_UPPER = np.int8(2)
+MATE_STORE_THRESHOLD = MATE - 1000
 
 
 @njit(cache=False)
@@ -141,6 +178,48 @@ def _score_moves(
 
 
 @njit(cache=False)
+def _score_moves2(
+    bb: np.ndarray,
+    meta: np.ndarray,
+    from_arr: np.ndarray,
+    to_arr: np.ndarray,
+    promo_arr: np.ndarray,
+    count: int,
+    pv_from: int,
+    pv_to: int,
+    pv_promo: int,
+    k1_from: int,
+    k1_to: int,
+    k1_promo: int,
+    k2_from: int,
+    k2_to: int,
+    k2_promo: int,
+    history_table: np.ndarray,
+) -> np.ndarray:
+    """Same per-move scoring as _score_moves, but a plain quiet move (base score exactly 0: not
+    the hash/PV move, not a promotion, not a capture) additionally gets a killer-move bonus, or
+    failing that its from/to history score -- both ranked below every capture and promotion,
+    above zero. Inlined into one function (rather than calling a per-move helper in the loop, as
+    an earlier version did) purely to keep numba's compile graph smaller -- this and negamax are
+    the two most expensive functions to JIT in the whole engine.
+    """
+    scores = np.empty(count, dtype=np.int64)
+    for i in range(count):
+        from_sq, to_sq, promo = from_arr[i], to_arr[i], promo_arr[i]
+        base = _move_score(bb, meta, from_sq, to_sq, promo, pv_from, pv_to, pv_promo)
+        if base != 0:
+            scores[i] = base
+        elif from_sq == k1_from and to_sq == k1_to and promo == k1_promo:
+            scores[i] = 5001
+        elif from_sq == k2_from and to_sq == k2_to and promo == k2_promo:
+            scores[i] = 5000
+        else:
+            h = history_table[from_sq * 64 + to_sq]
+            scores[i] = h if h < 4999 else 4999
+    return scores
+
+
+@njit(cache=False)
 def quiescence(
     bb: np.ndarray,
     meta: np.ndarray,
@@ -203,13 +282,25 @@ def negamax(
     ply: int,
     history: np.ndarray,
     hist_len: int,
+    tt_key: np.ndarray,
+    tt_depth: np.ndarray,
+    tt_score: np.ndarray,
+    tt_flag: np.ndarray,
+    tt_from: np.ndarray,
+    tt_to: np.ndarray,
+    tt_promo: np.ndarray,
+    killer_from: np.ndarray,
+    killer_to: np.ndarray,
+    killer_promo: np.ndarray,
+    history_table: np.ndarray,
 ) -> int:
     counters[0] += 1
     if _time_up(deadline, counters):
         return 0
 
+    h = position_hash(bb, meta)
+
     if ply % 2 == 0:
-        h = position_hash(bb, meta)
         matches = 0
         for i in range(hist_len):
             if history[i] == h:
@@ -221,6 +312,31 @@ def negamax(
     else:
         child_hist_len = hist_len
 
+    orig_alpha = alpha
+    tt_idx = int(h & TT_MASK)
+    hint_from, hint_to, hint_promo = -1, -1, -1
+    if tt_key[tt_idx] == h:
+        hint_from = int(tt_from[tt_idx])
+        hint_to = int(tt_to[tt_idx])
+        hint_promo = int(tt_promo[tt_idx])
+        if tt_depth[tt_idx] >= depth:
+            raw = int(tt_score[tt_idx])
+            if raw >= MATE_STORE_THRESHOLD:
+                s = raw - ply
+            elif raw <= -MATE_STORE_THRESHOLD:
+                s = raw + ply
+            else:
+                s = raw
+            flag = tt_flag[tt_idx]
+            if flag == TT_EXACT:
+                return s
+            if flag == TT_LOWER and s > alpha:
+                alpha = s
+            elif flag == TT_UPPER and s < beta:
+                beta = s
+            if alpha >= beta:
+                return s
+
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     if count == 0:
         return -MATE if is_check(bb, meta) else 0
@@ -228,26 +344,81 @@ def negamax(
     if depth <= 0:
         return quiescence(bb, meta, alpha, beta, deadline, counters, QUIESCENCE_MAX_PLIES)
 
-    scores = _score_moves(bb, meta, from_arr, to_arr, promo_arr, count, -1, -1, -1)
+    k1_from = int(killer_from[ply, 0])
+    k1_to, k1_promo = int(killer_to[ply, 0]), int(killer_promo[ply, 0])
+    k2_from = int(killer_from[ply, 1])
+    k2_to, k2_promo = int(killer_to[ply, 1]), int(killer_promo[ply, 1])
+    scores = _score_moves2(
+        bb, meta, from_arr, to_arr, promo_arr, count,
+        hint_from, hint_to, hint_promo,
+        k1_from, k1_to, k1_promo, k2_from, k2_to, k2_promo,
+        history_table,
+    )
     order = np.argsort(-scores)
 
     best = -INF
+    best_idx = -1
     for oi in range(count):
         idx = order[oi]
         f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
         new_bb, new_meta = make_move(bb, meta, f, t, p)
-        score = -negamax(
-            new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters,
-            ply + 1, history, child_hist_len,
-        )
+        if oi == 0:
+            score = -negamax(
+                new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters,
+                ply + 1, history, child_hist_len,
+                tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
+                killer_from, killer_to, killer_promo, history_table,
+            )
+        else:
+            score = -negamax(
+                new_bb, new_meta, depth - 1, -alpha - 1, -alpha, deadline, counters,
+                ply + 1, history, child_hist_len,
+                tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
+                killer_from, killer_to, killer_promo, history_table,
+            )
+            if not counters[1] and alpha < score < beta:
+                score = -negamax(
+                    new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters,
+                    ply + 1, history, child_hist_len,
+                    tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
+                    killer_from, killer_to, killer_promo, history_table,
+                )
         if counters[1]:
             return 0
         if score > best:
             best = score
+            best_idx = idx
         if best > alpha:
             alpha = best
         if alpha >= beta:
+            if p < 0 and not is_capture(bb, meta, f, t):
+                if not (f == k1_from and t == k1_to and p == k1_promo):
+                    killer_from[ply, 1], killer_to[ply, 1], killer_promo[ply, 1] = (
+                        killer_from[ply, 0], killer_to[ply, 0], killer_promo[ply, 0],
+                    )
+                    killer_from[ply, 0], killer_to[ply, 0], killer_promo[ply, 0] = f, t, p
+                history_table[f * 64 + t] += depth * depth
             break
+
+    tt_key[tt_idx] = h
+    tt_depth[tt_idx] = depth
+    if best >= MATE_STORE_THRESHOLD:
+        tt_score[tt_idx] = best + ply
+    elif best <= -MATE_STORE_THRESHOLD:
+        tt_score[tt_idx] = best - ply
+    else:
+        tt_score[tt_idx] = best
+    if best <= orig_alpha:
+        tt_flag[tt_idx] = TT_UPPER
+    elif best >= beta:
+        tt_flag[tt_idx] = TT_LOWER
+    else:
+        tt_flag[tt_idx] = TT_EXACT
+    if best_idx != -1:
+        tt_from[tt_idx] = np.int8(from_arr[best_idx])
+        tt_to[tt_idx] = np.int8(to_arr[best_idx])
+        tt_promo[tt_idx] = np.int8(promo_arr[best_idx])
+
     return best
 
 
@@ -289,7 +460,8 @@ def claim_eligible_for_opponent(
 
     Deliberately root-only (called from search_root / agent._search_restricted, not from inside
     negamax's own recursion): each level is a full extra generate_legal, affordable once per real
-    move decision but not throughout the tree.
+    move decision but not throughout the tree. Never consults the transposition table -- always
+    recomputed from the real history arrays, so a cached search score can never mask a claim.
     """
     h = position_hash(bb, meta)
     matches = 0
@@ -331,12 +503,24 @@ def search_root(
     hist_len: int,
     opponent_history: np.ndarray,
     opponent_hist_len: int,
+    tt_key: np.ndarray,
+    tt_depth: np.ndarray,
+    tt_score: np.ndarray,
+    tt_flag: np.ndarray,
+    tt_from: np.ndarray,
+    tt_to: np.ndarray,
+    tt_promo: np.ndarray,
+    killer_from: np.ndarray,
+    killer_to: np.ndarray,
+    killer_promo: np.ndarray,
+    history_table: np.ndarray,
 ) -> tuple[int, int, int, int, bool]:
     """hist_len counts our-turn positions already recorded, including the root's own -- the
     caller (agent.py) writes history[hist_len - 1] = hash(bb, meta) before calling this, since it
     already needs that hash for the persistent cross-move history anyway. opponent_hist_len
     counts the real game's own past opponent-turn positions, one recorded per move we have
-    actually played -- see claim_eligible_for_opponent.
+    actually played -- see claim_eligible_for_opponent. tt_* / killer_* / history_table are
+    threaded straight into negamax; see this module's docstring.
     """
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     if count == 0:
@@ -354,9 +538,24 @@ def search_root(
         idx = order[oi]
         f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
         new_bb, new_meta = make_move(bb, meta, f, t, p)
-        score = -negamax(
-            new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters, 1, history, hist_len
-        )
+        if oi == 0:
+            score = -negamax(
+                new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters, 1, history,
+                hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
+                killer_from, killer_to, killer_promo, history_table,
+            )
+        else:
+            score = -negamax(
+                new_bb, new_meta, depth - 1, -alpha - 1, -alpha, deadline, counters, 1, history,
+                hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
+                killer_from, killer_to, killer_promo, history_table,
+            )
+            if not counters[1] and alpha < score < beta:
+                score = -negamax(
+                    new_bb, new_meta, depth - 1, -beta, -alpha, deadline, counters, 1, history,
+                    hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
+                    killer_from, killer_to, killer_promo, history_table,
+                )
         if counters[1]:
             return best_from, best_to, best_promo, best_score, False
         if claim_eligible_for_opponent(
@@ -396,3 +595,31 @@ def quick_best_move(
 
 def new_counters() -> np.ndarray:
     return np.zeros(2, dtype=np.int64)
+
+
+def new_tt() -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
+    """A fresh, empty transposition table -- parallel arrays, always-replace. depth=-1 marks an
+    empty slot implicitly (any real search depth is >= 0, so a real entry always compares >= any
+    depth request the first time it is written; key is separately checked for a match anyway).
+    """
+    key = np.zeros(TT_SIZE, dtype=np.uint64)
+    depth = np.full(TT_SIZE, -1, dtype=np.int32)
+    score = np.zeros(TT_SIZE, dtype=np.int32)
+    flag = np.zeros(TT_SIZE, dtype=np.int8)
+    move_from = np.full(TT_SIZE, -1, dtype=np.int8)
+    move_to = np.full(TT_SIZE, -1, dtype=np.int8)
+    move_promo = np.full(TT_SIZE, -1, dtype=np.int8)
+    return key, depth, score, flag, move_from, move_to, move_promo
+
+
+def new_killers() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    killer_from = np.full((MAX_KILLER_PLY, 2), -1, dtype=np.int8)
+    killer_to = np.full((MAX_KILLER_PLY, 2), -1, dtype=np.int8)
+    killer_promo = np.full((MAX_KILLER_PLY, 2), -1, dtype=np.int8)
+    return killer_from, killer_to, killer_promo
+
+
+def new_history_table() -> np.ndarray:
+    return np.zeros(64 * 64, dtype=np.int32)
