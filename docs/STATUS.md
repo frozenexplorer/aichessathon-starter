@@ -1,7 +1,8 @@
 # Status
 
-Handoff snapshot as of the Tier 3 pass (2026-09-05), on top of Tier 2 (commit `02ec418`) and Tier 1
-(commit `12a38f9`), both documented below. Read this instead of replaying the whole build history.
+Handoff snapshot as of the Tier 4 pass (2026-09-05), on top of Tier 3, Tier 2 (commit `02ec418`),
+and Tier 1 (commit `12a38f9`), all documented below. Read this instead of replaying the whole
+build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
 08:00-22:00; Daily Five runs 2026-09-06 through 2026-09-10.
 
@@ -28,8 +29,9 @@ attacks.py      precomputed knight/king/pawn tables; sliding pieces (bishop/rook
                 hardcoded (see the module docstring), no runtime magic search
 movegen.py      pseudo-legal + legal generation, copy-make (not incremental make/unmove)
 evaluate.py     tapered material + PST (midgame/endgame king blend by game phase), pawn
-                structure (doubled/isolated/passed), bishop pair, rook open/semi-open files,
-                king pawn-shield, differential piece mobility -- all jitted
+                structure (doubled/isolated/passed, the passed-pawn bonus itself phase-blended),
+                bishop pair, rook open/semi-open files, king pawn-shield, differential piece
+                mobility, king proximity to passed-pawn promotion squares -- all jitted
 zobrist.py      position hashing, for repetition detection and the transposition table
 search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table,
                 killer-move + history + counter-move ordering, principal variation search (PVS)
@@ -198,6 +200,24 @@ verified specifically by running `tests/test_repetition.py` (calls `negamax` dir
 broader suite, since a wrong argument count there would surface immediately as a `TypeError`
 rather than silently.
 
+## Tier 4: what changed and why
+
+One further item, picked up from the "further ideas raised but not yet picked up" note at the
+bottom of this doc (the other, a locally-generated retrograde-analysis endgame tablebase, stays
+unpicked -- multi-day scope not worth it against the time remaining):
+
+1. **Endgame-specific pawn/king eval terms** (`evaluate.py`) -- two additions, both phase-blended
+   the same way as the king PST (`material_and_pst`) so they fade in as material comes off rather
+   than applying at full strength in the middlegame where they don't belong:
+   - The existing rank-scaled passed-pawn bonus (`PASSED_PAWN_BONUS`, now split into
+     `_MID`/`_END` arrays) is blended by phase instead of applied flatly -- a passed pawn on rank
+     6 is worth far more with two rooks and a queen off the board than at move 10.
+   - A new king-proximity term (`passed_pawn_king_distance`): for each passed pawn, Chebyshev
+     distance from each king to that pawn's promotion square, rewarded when the friendly king is
+     closer and penalised when the enemy king is (the "rule of the square" -- whichever king gets
+     there first tends to decide whether the pawn queens or gets caught). Zero-cost in the
+     middlegame (`endgame_weight == 0` short-circuits before the board scan).
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -229,6 +249,9 @@ rather than silently.
   `_search_restricted`, `_warm_up`, and `test_repetition.py`) was verified by running
   `tests/test_repetition.py` first specifically, since it calls `negamax` directly and a wrong
   argument count there surfaces immediately as a `TypeError`.
+- Tier 4: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks) clean, plus
+  functional in-process games (checkmates both colours from the start position, 2/2 KBN-vs-K
+  tablebase-endgame checkmates) after the eval change.
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -293,7 +316,9 @@ pruning, SEE, LMR, search extensions, magic bitboards) are the Tier 2 work above
 item-specific reasons in the Tier 2 section above, not for lack of time -- see there before
 picking any of them back up. Tier 3 (mobility eval, futility pruning, a bigger two-tier TT, IID,
 counter-move heuristic, delta pruning) is a second round of optimizations beyond FUTURE.md's
-original list -- not itself tracked in FUTURE.md, see the Tier 3 section above instead. Further
-ideas raised but not yet picked up: endgame-specific eval terms (king-distance-to-passed-pawn,
-rank-scaled passed-pawn bonus), and generating a small custom endgame tablebase locally via
-retrograde analysis instead of downloading one (item 8's blocker).
+original list -- not itself tracked in FUTURE.md, see the Tier 3 section above instead. Tier 4
+(phase-blended passed-pawn bonus, king-distance-to-passed-pawn) picked up one of the two further
+ideas noted here previously -- see the Tier 4 section above. Still not picked up: generating a
+small custom endgame tablebase locally via retrograde analysis instead of downloading one (item
+8's blocker) -- multi-day scope, not worth it against the time remaining unless everything else is
+done early.

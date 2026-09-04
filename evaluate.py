@@ -8,13 +8,17 @@ endgame-only table (centralizing instead of hiding in a castled corner), blended
 -- a king that wants safety mid-game is instead an active piece needed for the win once material
 has thinned out.
 
-Beyond material + PST, five cheap positional terms are added, all in the same white-minus-black,
+Beyond material + PST, six cheap positional terms are added, all in the same white-minus-black,
 own-file/precomputed-mask style as the rest of this module so they stay jit-friendly without a
-second pass over the board: pawn structure (doubled, isolated, passed), bishop pair, rooks on
-open/semi-open files, a king pawn-shield bonus that -- like the king PST -- fades out via the
-same phase blend as material comes off the board, and piece mobility (knight/bishop/rook/queen
-squares attacked, excluding squares held by an own piece) -- affordable per node now that sliding
-attacks are magic-bitboard lookups (see attacks.py) rather than ray-casts.
+second pass over the board: pawn structure (doubled, isolated, passed -- the passed-pawn bonus
+itself phase-blended like the king PST, since a passed pawn is worth far more with fewer pieces
+left to stop it), bishop pair, rooks on open/semi-open files, a king pawn-shield bonus that --
+like the king PST -- fades out via the same phase blend as material comes off the board, piece
+mobility (knight/bishop/rook/queen squares attacked, excluding squares held by an own piece) --
+affordable per node now that sliding attacks are magic-bitboard lookups (see attacks.py) rather
+than ray-casts -- and, phased in the same way as the passed-pawn bonus, king proximity to each
+passed pawn's promotion square (the "rule of the square" -- whichever king is closer tends to
+decide whether the pawn queens or gets caught).
 """
 
 import numpy as np
@@ -112,10 +116,12 @@ MOBILITY_WEIGHT = np.int32(2)
 BISHOP_PAIR_BONUS = np.int32(30)
 DOUBLED_PAWN_PENALTY = np.int32(10)
 ISOLATED_PAWN_PENALTY = np.int32(15)
-PASSED_PAWN_BONUS = np.array([0, 5, 10, 20, 35, 60, 100, 0], dtype=np.int32)
+PASSED_PAWN_BONUS_MID = np.array([0, 5, 10, 20, 35, 60, 100, 0], dtype=np.int32)
+PASSED_PAWN_BONUS_END = np.array([0, 10, 20, 40, 70, 120, 200, 0], dtype=np.int32)
 ROOK_SEMI_OPEN_BONUS = np.int32(10)
 ROOK_OPEN_BONUS = np.int32(20)
 KING_SHIELD_BONUS = np.int32(8)
+KING_DISTANCE_WEIGHT = np.int32(4)
 
 
 def _build_file_masks() -> np.ndarray:
@@ -229,7 +235,7 @@ def material_and_pst(bb: np.ndarray, phase: int) -> int:
 
 
 @njit(cache=False)
-def pawn_structure(bb: np.ndarray) -> int:
+def pawn_structure(bb: np.ndarray, phase: int) -> int:
     score = np.int32(0)
     white_pawns = bb[WHITE * 6 + PAWN]
     black_pawns = bb[BLACK * 6 + PAWN]
@@ -245,16 +251,56 @@ def pawn_structure(bb: np.ndarray) -> int:
     for square in range(64):
         bit = ONE << np.uint64(square)
         f = square % 8
+        rank = square // 8
         if white_pawns & bit:
             if white_pawns & ADJACENT_FILE_MASKS[f] == 0:
                 score -= ISOLATED_PAWN_PENALTY
             if black_pawns & PASSED_MASK_WHITE[square] == 0:
-                score += PASSED_PAWN_BONUS[square // 8]
+                mid, end = PASSED_PAWN_BONUS_MID[rank], PASSED_PAWN_BONUS_END[rank]
+                score += (mid * phase + end * (PHASE_MAX - phase)) // PHASE_MAX
         if black_pawns & bit:
             if black_pawns & ADJACENT_FILE_MASKS[f] == 0:
                 score += ISOLATED_PAWN_PENALTY
             if white_pawns & PASSED_MASK_BLACK[square] == 0:
-                score -= PASSED_PAWN_BONUS[7 - square // 8]
+                mid, end = PASSED_PAWN_BONUS_MID[7 - rank], PASSED_PAWN_BONUS_END[7 - rank]
+                score -= (mid * phase + end * (PHASE_MAX - phase)) // PHASE_MAX
+    return int(score)
+
+
+@njit(cache=False)
+def _chebyshev(sq1: int, sq2: int) -> int:
+    df = abs(sq1 % 8 - sq2 % 8)
+    dr = abs(sq1 // 8 - sq2 // 8)
+    return df if df > dr else dr
+
+
+@njit(cache=False)
+def passed_pawn_king_distance(bb: np.ndarray, phase: int) -> int:
+    """Rule-of-the-square proxy: for each passed pawn, reward the friendly king being closer to
+    its promotion square than the enemy king (and penalise the reverse), phase-blended like the
+    passed-pawn bonus above -- king proximity to a passed pawn's race is an endgame concern, not a
+    middlegame one where the king is still tucked away for safety.
+    """
+    endgame_weight = PHASE_MAX - phase
+    if endgame_weight == 0:
+        return 0
+    score = np.int32(0)
+    white_pawns = bb[WHITE * 6 + PAWN]
+    black_pawns = bb[BLACK * 6 + PAWN]
+    wk = king_square(bb, WHITE)
+    bk = king_square(bb, BLACK)
+
+    for square in range(64):
+        bit = ONE << np.uint64(square)
+        f = square % 8
+        if white_pawns & bit and black_pawns & PASSED_MASK_WHITE[square] == 0:
+            promo = 56 + f
+            diff = _chebyshev(bk, promo) - _chebyshev(wk, promo)
+            score += KING_DISTANCE_WEIGHT * diff * endgame_weight // PHASE_MAX
+        if black_pawns & bit and white_pawns & PASSED_MASK_BLACK[square] == 0:
+            promo = f
+            diff = _chebyshev(wk, promo) - _chebyshev(bk, promo)
+            score -= KING_DISTANCE_WEIGHT * diff * endgame_weight // PHASE_MAX
     return int(score)
 
 
@@ -331,9 +377,10 @@ def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
     phase = game_phase(bb)
     score = (
         material_and_pst(bb, phase)
-        + pawn_structure(bb)
+        + pawn_structure(bb, phase)
         + piece_features(bb, phase)
         + mobility_score(bb)
+        + passed_pawn_king_distance(bb, phase)
     )
     return int(score) if meta[0] == WHITE else int(-score)
 
