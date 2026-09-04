@@ -17,18 +17,35 @@ quick_best_move instead: even a depth-1 search can cascade through thousands of 
 nodes on a tactical position before the first check point, and at a few tens of milliseconds of
 clock left that alone can be enough to flag. quick_best_move never recurses, so it cannot.
 
-Repetition: negamax and search_root take a shared `history` array of zobrist hashes plus
-`hist_len`, the count of entries that precede the current node. get_move only ever sees
-positions where it is our own turn, and a real repeating shuffle shows up on both sides in
-lockstep, so only our-turn positions (even ply, root = ply 0) are ever recorded or checked --
-the array is indexed by "how many our-turn positions have occurred so far on the current path",
+Repetition, mechanism 1 -- our own turn recurring: negamax and search_root take a shared
+`history` array of zobrist hashes plus `hist_len`, the count of entries that precede the current
+node. Only our-turn positions (even ply, root = ply 0) are ever recorded or checked here -- the
+array is indexed by "how many our-turn positions have occurred so far on the current path",
 which a plain depth-first walk keeps correct with no explicit push/pop: a node writes its own
 slot once, and a later sibling at the same ply simply overwrites it when the search backtracks.
 agent.py owns the persistent real-game prefix and writes the root's own slot before calling
 search_root; everything at ply >= 1 is written by negamax itself as it descends. If a line would
 make a position recur a third time, it scores as an immediate draw (0) instead of running eval
-or search on it further -- alpha-beta then avoids it on its own when winning (0 loses to a
-positive score) and walks into it when losing (0 beats a negative one).
+or search on it further.
+
+That alone is not sufficient, for two separate reasons, both found by a won game that kept
+drawing (see agent.py's module docstring for the two real games). First: the harness's referee
+checks Board.outcome(claim_draw=True) *before* asking either side for a move, and python-chess's
+can_claim_threefold_repetition() fires the instant the side to move *has some legal reply* that
+would create a third occurrence -- not only once one is actually played. Second: it also fires
+when the *current* position (the one about to be handed over, the opponent's turn) has itself
+already occurred twice before -- a repeat of an opponent-turn position counts on its own, not
+only when it happens to line up with one of ours.
+
+claim_eligible_for_opponent checks both: condition two is a direct lookup against
+`opponent_history`, the real game's own past opponent-turn positions (one appended per move we
+actually play, in agent.py -- not extended during search, since only the real, played sequence
+matters for what has actually occurred); condition one is one extra generate_legal on the
+position we would hand over, matching each of the opponent's replies against `history`. Either
+way, search_root / agent._search_restricted cap that candidate move's score at 0, so a move that
+merely offers the position is treated the same as one that plays it. Root-only, not inside
+negamax's own recursion: condition one is a full extra movegen per candidate move, affordable
+once per real move decision but not throughout the tree.
 """
 
 import time
@@ -235,6 +252,72 @@ def negamax(
 
 
 @njit(cache=False)
+def claim_eligible_for_opponent(
+    bb: np.ndarray,
+    meta: np.ndarray,
+    history: np.ndarray,
+    hist_len: int,
+    opponent_history: np.ndarray,
+    opponent_hist_len: int,
+    lookahead: int,
+) -> bool:
+    """True if handing over the position `bb`/`meta` (the opponent's turn, right after one of
+    our candidate moves) would let the harness's referee auto-draw before we are ever asked to
+    move again -- python-chess's can_claim_threefold_repetition(), which Board.outcome(claim_draw
+    =True) calls before asking either side for a move, matches on two conditions:
+
+    (a) this exact position has already occurred twice before (this handoff would be the 3rd) --
+        checked directly against opponent_history, the real game's own past opponent-turn
+        positions (recorded once per move we actually play, in agent.py).
+    (b) the opponent has some legal reply that would make a position recur a third time --
+        checked by generating their replies and matching each against `history`, our own
+        real-plus-in-search-so-far turn positions (see this module's docstring).
+
+    Neither depends on what the opponent would actually choose to play, so a move of ours
+    creating either condition must be scored as if it directly caused the draw.
+
+    That is still not the whole story: the same auto-draw applies to *our* next position too, and
+    it applies before we are ever consulted -- so even if handing over `bb`/`meta` looks safe, an
+    opponent reply we do not control could land us on a position where the referee ends the game
+    on our own next (still unconsulted) turn. `lookahead` recurses one call further per unit,
+    with the two history arrays swapped, to check exactly that for each of the opponent's
+    replies; two real games were needed to find these two conditions plus this recursive case
+    between them (see agent.py's module docstring), so this is deliberately bounded rather than
+    assumed complete for arbitrary depth -- lookahead=1, used at the call sites in search_root /
+    agent._search_restricted, closes both games actually observed while keeping the cost bounded
+    (branching^2 per candidate root move, still small at these endgame piece counts).
+
+    Deliberately root-only (called from search_root / agent._search_restricted, not from inside
+    negamax's own recursion): each level is a full extra generate_legal, affordable once per real
+    move decision but not throughout the tree.
+    """
+    h = position_hash(bb, meta)
+    matches = 0
+    for j in range(opponent_hist_len):
+        if opponent_history[j] == h:
+            matches += 1
+    if matches >= 2:
+        return True
+
+    from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
+    for i in range(count):
+        new_bb, new_meta = make_move(bb, meta, from_arr[i], to_arr[i], promo_arr[i])
+        reply_hash = position_hash(new_bb, new_meta)
+        reply_matches = 0
+        for j in range(hist_len):
+            if history[j] == reply_hash:
+                reply_matches += 1
+        if reply_matches >= 2:
+            return True
+        if lookahead > 0 and claim_eligible_for_opponent(
+            new_bb, new_meta, opponent_history, opponent_hist_len, history, hist_len,
+            lookahead - 1,
+        ):
+            return True
+    return False
+
+
+@njit(cache=False)
 def search_root(
     bb: np.ndarray,
     meta: np.ndarray,
@@ -246,10 +329,14 @@ def search_root(
     pv_promo: int,
     history: np.ndarray,
     hist_len: int,
+    opponent_history: np.ndarray,
+    opponent_hist_len: int,
 ) -> tuple[int, int, int, int, bool]:
     """hist_len counts our-turn positions already recorded, including the root's own -- the
     caller (agent.py) writes history[hist_len - 1] = hash(bb, meta) before calling this, since it
-    already needs that hash for the persistent cross-move history anyway.
+    already needs that hash for the persistent cross-move history anyway. opponent_hist_len
+    counts the real game's own past opponent-turn positions, one recorded per move we have
+    actually played -- see claim_eligible_for_opponent.
     """
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     if count == 0:
@@ -272,6 +359,10 @@ def search_root(
         )
         if counters[1]:
             return best_from, best_to, best_promo, best_score, False
+        if claim_eligible_for_opponent(
+            new_bb, new_meta, history, hist_len, opponent_history, opponent_hist_len, 1
+        ):
+            score = min(score, 0)
         if score > best_score:
             best_score = score
             best_from, best_to, best_promo = f, t, p
