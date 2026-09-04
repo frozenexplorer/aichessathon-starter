@@ -118,30 +118,6 @@ above) and has been folded into the Tier 1 section rather than kept as an open i
 
 ## Future
 
-- **Adaptive time management** -- the flat `time_left/30 + increment` formula (`timeman.py`)
-  doesn't know a position is sharp vs quiet; it gives the same budget to a razor-sharp middlegame
-  as a simplified endgame. Surfaced directly by the blunder-position investigation above: 2.89s
-  was simply not enough depth for that position regardless of search quality. Spending more time
-  on volatile positions (e.g. by score instability across the last couple of iterative-deepening
-  depths) would be a targeted fix.
-- **Null-move pruning** -- biggest remaining raw speed lever (lets the search go deeper in the
-  same budget), needs a zugzwang guard (skip in king+pawn endgames / in check) or it risks
-  misplaying exactly the kind of tightly-boxed endgame DTZ was just added to fix.
-- **Static exchange evaluation (SEE)** -- replace MVV-LVA's rough capture ordering with real
-  exchange evaluation; also lets quiescence prune clearly-losing captures instead of exploring
-  them, which would help contain the node counts seen in sharp middlegames (500K-2M+ nodes at
-  depth 7-9 in the position investigated above).
-- **Opening book** -- removes early-game time spent re-deriving known theory; low risk, easy to
-  bound in size.
-- **Magic bitboards** -- sliding-piece attacks still ray-cast per query. The real node/sec lever
-  left, but touches `movegen.py`/`attacks.py` and needs the same perft/differential rigor redone,
-  the highest correctness-risk change available. Also currently the single largest fixed cost in
-  init time (~16-18s) -- worth revisiting for that reason too if the margin above ever tightens
-  further.
-- **Late move reductions (LMR)** -- real speed win, easy to get subtly wrong; wants to sit on top
-  of the TT/killers now in place, not replace them.
-- **5-man Syzygy WDL** -- the full set is ~378MB, too big to ship complete; would need a curated
-  subset (e.g. pawnless endings, common rook endgames).
-- **NN evaluation** -- still deprioritized: depth beats eval quality at these node counts per the
-  numba baseline's own evidence, and training risk is high against the competition timeline. Only
-  worth it if everything above is done with days to spare before 2026-09-11 11:00.
+See `docs/FUTURE.md` for the full prioritized list (adaptive time management, aspiration windows,
+null-move pruning, SEE, LMR, search extensions, magic bitboards, a curated 5-man tablebase subset,
+an opening book, NN evaluation) with rationale, effort, and risk for each.
