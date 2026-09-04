@@ -649,33 +649,26 @@ check step.
 
 See `docs/FUTURE.md` -- items 1-7 (adaptive time management, aspiration windows, null-move
 pruning, SEE, LMR, search extensions, magic bitboards) are the Tier 2 work above. Items 8-10
-(curated 5-man tablebase subset, opening book, NN evaluation) remain undone for the
-item-specific reasons in the Tier 2 section above, not for lack of time -- see there before
-picking any of them back up. Tier 3 (mobility eval, futility pruning, a bigger two-tier TT, IID,
-counter-move heuristic, delta pruning) is a second round of optimizations beyond FUTURE.md's
-original list -- not itself tracked in FUTURE.md, see the Tier 3 section above instead. Tier 4
-(phase-blended passed-pawn bonus, king-distance-to-passed-pawn) picked up one of the two further
-ideas noted here previously -- see the Tier 4 section above. Tier 5 (fork/hanging-piece/pawn-
-threat and pin/x-ray/skewer eval terms) was picked up on a direct user report that middlegame
-tactics were still being missed -- see the Tier 5 section above. Tier 6 (the quiescence-in-check
-fix) came from the same report, found while looking for further eval-side tactical terms to add --
-see the Tier 6 section above. From the same "further ideas" discussion: history malus (penalize
-quiet moves that fail to cause a cutoff, not just reward the ones that do) and a king-safety eval
-term (attacker count/weight near the enemy king, not just the existing pawn-shield bonus) are
-next in line if picked back up, then reverse futility/static-null pruning, late move pruning, and
-singular extensions as further search-side levers. Tier 7 (history malus), Tier 8 (king safety),
-and Tier 9 (reverse futility/static-null pruning, late move pruning) picked up everything on that
-list except singular extensions -- see their sections above. Singular extensions is next if
-continuing this list (higher risk/effort, interacts with the existing extension budget), alongside
-two correctness/robustness gaps raised in the same discussion: fifty-move-rule and
-insufficient-material draw detection inside search (currently absent -- tablebase probing is
-root-only, so internal search nodes have no such awareness), and a move-overhead safety margin in
-`timeman.py` for real subprocess/IO latency in competition play. Tier 10 (fifty-move rule) and
-Tier 11 (insufficient material) picked up both draw-detection gaps -- see their sections above.
-Tier 12 (move-overhead safety margin) picked that up too -- see its section above. Singular
-extensions is the last item from that discussion, and the highest-risk one (interacts with the
-existing extension budget) -- Tier 13 picked it up, done last and most carefully of everything on
-this list; see its own section above. That closes out every item raised in the "further ideas"
-discussion. Still not picked up: generating a small custom endgame tablebase locally via
-retrograde analysis instead of downloading one (item 8's blocker) -- multi-day scope, not worth it
-against the time remaining unless everything else is done early.
+(curated 5-man tablebase subset, opening book, NN evaluation) remain undone for the item-specific
+reasons in the Tier 2 section above, not for lack of time -- see there before picking any of them
+back up.
+
+Tiers 3-13 are further passes beyond FUTURE.md's original list, none of them tracked in that file
+-- see each one's own section above for what it covers and why. In short, two rounds of further
+ideas were proposed and fully worked through, one item at a time with the full gate re-run after
+each: the first round (Tier 3) added mobility eval, futility pruning, a bigger two-tier TT, IID,
+the counter-move heuristic, and delta pruning. A direct user report that middlegame tactics were
+still being missed prompted the second round: Tier 4 picked up two previously-noted endgame-eval
+ideas (phase-blended passed pawns, king-distance-to-passed-pawn); Tier 5 added tactical-motif eval
+terms (forks, hanging pieces, pawn threats, pins, x-rays/skewers) directly for the report; Tier 6,
+found while working on Tier 5, fixed a real search bug (quiescence never handled being in check
+correctly); a further "what else can be done" discussion produced six more items, all picked up
+in turn: Tier 7 (history malus), Tier 8 (king safety eval), Tier 9 (reverse-futility/static-null
+pruning, late move pruning), Tier 10 (fifty-move-rule draw detection), Tier 11 (insufficient-
+material draw detection), Tier 12 (a `timeman.py` move-overhead safety margin), and Tier 13
+(singular extensions, the highest-risk item on the list, done last and most carefully).
+
+That closes out every item raised across both rounds. Still not picked up: generating a small
+custom endgame tablebase locally via retrograde analysis instead of downloading one (item 8's
+blocker) -- multi-day scope, not worth it against the time remaining unless everything else is
+done early.

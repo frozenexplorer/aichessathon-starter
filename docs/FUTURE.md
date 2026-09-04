@@ -4,13 +4,20 @@ Ranked by strength-gained-per-day-of-effort given the 2026-09-11 11:00 London de
 raw impact alone. Tier 1 (transposition table, killer/history move ordering, PVS, DTZ tablebase,
 tapered/richer evaluation) and Tier 2 (items 1-7 below) are both shipped; see `docs/STATUS.md`
 for what each covers and the current verified state, including why items 8-10 remain undone for
-reasons specific to each, not time pressure. A further Tier 3 pass (mobility eval, futility
-pruning, a bigger two-tier TT, internal iterative deepening, a counter-move heuristic, delta
-pruning) is also shipped on top of this list -- not itself tracked here since it wasn't part of
-the original prioritization; see `docs/STATUS.md`'s Tier 3 section. Re-run `tests/perft.py`,
-`tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`, `ruff`, and
-`mypy --strict` after any change to `search.py`, `movegen.py`, `attacks.py`, or `evaluate.py`. Do
-not gate on local init-time measurements (see `docs/STATUS.md`'s final call on this).
+reasons specific to each, not time pressure. Tiers 3-13 are further passes shipped on top of this
+list, none of them part of the original prioritization here -- see `docs/STATUS.md`'s own
+Tier 3 through Tier 13 sections for what each covers (in short: Tier 3 mobility/futility/bigger
+TT/IID/counter-move/delta pruning; Tier 4 endgame-specific eval; Tier 5 threat/pin/x-ray eval;
+Tier 6 a quiescence-in-check search bug fix; Tier 7 history malus; Tier 8 king safety eval;
+Tier 9 reverse-futility and late-move pruning; Tier 10 fifty-move-rule draw detection; Tier 11
+insufficient-material draw detection; Tier 12 a timeman move-overhead safety margin; Tier 13
+singular extensions). Re-run the full gate -- `tests/perft.py`, `tests/test_repetition.py`,
+`tests/test_see.py`, `tests/test_magic_attacks.py`, `tests/test_threats.py`,
+`tests/test_quiescence_check.py`, `tests/test_king_safety.py`, `tests/test_fifty_move.py`,
+`tests/test_insufficient_material.py`, `tests/test_timeman.py`, `tests/test_singular_extension.py`,
+`ruff`, and `mypy --strict` -- after any change to `search.py`, `movegen.py`, `attacks.py`,
+`evaluate.py`, or `timeman.py`. Do not gate on local init-time measurements (see
+`docs/STATUS.md`'s final call on this).
 
 1. **[DONE, Tier 2] Adaptive time management** (`timeman.py`) -- the flat `time_left/30 + increment` formula
    gives a razor-sharp middlegame the same budget as a simplified endgame. This is not
