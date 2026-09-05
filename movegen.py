@@ -14,11 +14,46 @@ import numpy as np
 from numba import njit
 
 from attacks import KING_ATTACKS, KNIGHT_ATTACKS, PAWN_ATTACKS, bishop_attacks, rook_attacks
-from bitboard import BISHOP, BLACK, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE
+from bitboard import BISHOP, BLACK, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE, i64
 
 MAX_MOVES = 256
 ONE = np.uint64(1)
 NO_SQUARE = np.int8(-1)
+
+# Castling-square constants for generate_pseudo_legal's attacked_by() checks below, wrapped once
+# at module level via bitboard.i64 rather than at each call site -- i64() itself is plain,
+# un-jitted Python, so calling it directly from inside an njit function body (as opposed to here,
+# at ordinary module-import time) fails to compile at all (numba cannot call an untyped Python
+# function in nopython mode). See docs/plan.md Phase 1.1(a): a bare int literal crossing an njit
+# call boundary is typed as a distinct Literal[int] per value, which is what made attacked_by
+# (and, transitively, bishop_attacks/rook_attacks) compile a dozen-odd specialisations before this.
+_SQ_C2 = i64(2)
+_SQ_C3 = i64(3)
+_SQ_C4 = i64(4)
+_SQ_C5 = i64(5)
+_SQ_C6 = i64(6)
+_SQ_C58 = i64(58)
+_SQ_C59 = i64(59)
+_SQ_C60 = i64(60)
+_SQ_C61 = i64(61)
+_SQ_C62 = i64(62)
+
+
+@njit(cache=False)
+def _i64(v: int) -> int:
+    """Runtime counterpart to bitboard.i64: casts a value read from an int8-dtyped array (or a
+    bare `meta[0]`) to int64 *from inside an njit function body*, where bitboard.i64 itself can't
+    be called (it is plain, un-jitted Python -- calling it in nopython mode fails to compile
+    outright). Python's own `int(...)` looks like it should do the same thing but does not: numba
+    treats it as a no-op identity conversion when the input is already some integer type, so
+    `int(meta[0])` stays int8, not int64 -- confirmed the hard way (docs/plan.md Phase 1.1(b)/(c))
+    when using it caused every from/to/color-consuming function to regress back to multiple
+    specialisations. Routing the cast through this dedicated njit function's own explicit
+    `np.int64(...)` return forces the widening every caller needs, at the cost of compiling this
+    one-line function once per distinct *input* type it is fed (cheap: the body is trivial, and
+    NUMBA_OPT=1 inlines it in practice).
+    """
+    return np.int64(v)  # type: ignore[return-value]
 
 
 def _build_square_color_mask() -> np.uint64:
@@ -75,7 +110,7 @@ def attacked_by(bb: np.ndarray, all_occ: np.uint64, color: int, square: int) -> 
 
 @njit(cache=False)
 def is_check(bb: np.ndarray, meta: np.ndarray) -> bool:
-    color = meta[0]
+    color = _i64(meta[0])
     return attacked_by(bb, occ_all(bb), 1 - color, king_square(bb, color))
 
 
@@ -95,6 +130,17 @@ def _popcount64(bits: np.uint64) -> int:
         bits &= bits - ONE
         count += 1
     return count
+
+
+@njit(cache=False)
+def _bit_scan(bits: np.uint64) -> int:
+    """Index of the lowest set bit, or -1 if `bits` is zero. Shared home for what used to be two
+    separate copies (search.py and evaluate.py both had their own) -- see docs/plan.md Phase 1.7.
+    """
+    for square in range(64):
+        if bits & (ONE << np.uint64(square)):
+            return square
+    return -1
 
 
 @njit(cache=False)
@@ -157,7 +203,7 @@ def make_move(
 ) -> tuple[np.ndarray, np.ndarray]:
     new_bb = bb.copy()
     new_meta = meta.copy()
-    color = meta[0]
+    color = _i64(meta[0])
     opponent = 1 - color
     from_bit = ONE << np.uint64(from_sq)
     to_bit = ONE << np.uint64(to_sq)
@@ -215,7 +261,7 @@ def make_move(
 def generate_pseudo_legal(
     bb: np.ndarray, meta: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    color = meta[0]
+    color = _i64(meta[0])
     opponent = 1 - color
     own = occ_color(bb, color)
     opp = occ_color(bb, opponent)
@@ -320,9 +366,9 @@ def generate_pseudo_legal(
             if (
                 meta[1]
                 and not (all_occ & ((ONE << np.uint64(5)) | (ONE << np.uint64(6))))
-                and not attacked_by(bb, all_occ, BLACK, 4)
-                and not attacked_by(bb, all_occ, BLACK, 5)
-                and not attacked_by(bb, all_occ, BLACK, 6)
+                and not attacked_by(bb, all_occ, BLACK, _SQ_C4)
+                and not attacked_by(bb, all_occ, BLACK, _SQ_C5)
+                and not attacked_by(bb, all_occ, BLACK, _SQ_C6)
             ):
                 from_arr[count], to_arr[count] = 4, 6
                 count += 1
@@ -332,9 +378,9 @@ def generate_pseudo_legal(
                     all_occ
                     & ((ONE << np.uint64(1)) | (ONE << np.uint64(2)) | (ONE << np.uint64(3)))
                 )
-                and not attacked_by(bb, all_occ, BLACK, 4)
-                and not attacked_by(bb, all_occ, BLACK, 3)
-                and not attacked_by(bb, all_occ, BLACK, 2)
+                and not attacked_by(bb, all_occ, BLACK, _SQ_C4)
+                and not attacked_by(bb, all_occ, BLACK, _SQ_C3)
+                and not attacked_by(bb, all_occ, BLACK, _SQ_C2)
             ):
                 from_arr[count], to_arr[count] = 4, 2
                 count += 1
@@ -342,9 +388,9 @@ def generate_pseudo_legal(
             if (
                 meta[3]
                 and not (all_occ & ((ONE << np.uint64(61)) | (ONE << np.uint64(62))))
-                and not attacked_by(bb, all_occ, WHITE, 60)
-                and not attacked_by(bb, all_occ, WHITE, 61)
-                and not attacked_by(bb, all_occ, WHITE, 62)
+                and not attacked_by(bb, all_occ, WHITE, _SQ_C60)
+                and not attacked_by(bb, all_occ, WHITE, _SQ_C61)
+                and not attacked_by(bb, all_occ, WHITE, _SQ_C62)
             ):
                 from_arr[count], to_arr[count] = 60, 62
                 count += 1
@@ -354,9 +400,9 @@ def generate_pseudo_legal(
                     all_occ
                     & ((ONE << np.uint64(57)) | (ONE << np.uint64(58)) | (ONE << np.uint64(59)))
                 )
-                and not attacked_by(bb, all_occ, WHITE, 60)
-                and not attacked_by(bb, all_occ, WHITE, 59)
-                and not attacked_by(bb, all_occ, WHITE, 58)
+                and not attacked_by(bb, all_occ, WHITE, _SQ_C60)
+                and not attacked_by(bb, all_occ, WHITE, _SQ_C59)
+                and not attacked_by(bb, all_occ, WHITE, _SQ_C58)
             ):
                 from_arr[count], to_arr[count] = 60, 58
                 count += 1
@@ -369,7 +415,7 @@ def generate_legal(
     bb: np.ndarray, meta: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     from_arr, to_arr, promo_arr, count = generate_pseudo_legal(bb, meta)
-    color = meta[0]
+    color = _i64(meta[0])
 
     out_from = np.full(MAX_MOVES, NO_SQUARE, dtype=np.int8)
     out_to = np.full(MAX_MOVES, NO_SQUARE, dtype=np.int8)
@@ -377,7 +423,7 @@ def generate_legal(
     out_count = 0
 
     for i in range(count):
-        f, t, p = from_arr[i], to_arr[i], promo_arr[i]
+        f, t, p = _i64(from_arr[i]), _i64(to_arr[i]), _i64(promo_arr[i])
         new_bb, _new_meta = make_move(bb, meta, f, t, p)
         ksq = king_square(new_bb, color)
         if not attacked_by(new_bb, occ_all(new_bb), 1 - color, ksq):

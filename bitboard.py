@@ -16,8 +16,24 @@ parser, which is exactly the kind of code we do not want two implementations of.
 import chess
 import numpy as np
 
-WHITE = 0
-BLACK = 1
+
+def i64(value: int) -> int:
+    """Returns `value` as a *runtime* np.int64 while type-checking as plain `int`.
+
+    Numba types a bare Python int crossing an njit call boundary as a distinct `Literal[int]`
+    per value -- passing the same logical constant as both `Literal[int](0)` (a literal call
+    argument) and plain `int64` (an arithmetic result) compiles two separate specialisations of
+    every function it reaches (see docs/plan.md Phase 1.1(a)). Wrapping as `np.int64(...)` fixes
+    that, but a numpy scalar doesn't satisfy the `int`-annotated parameters mypy sees on njit
+    dispatchers (which mirror the wrapped function's own type hints) -- hence the return-type lie
+    here. Safe either way: every njit function these constants feed treats the value as a 64-bit
+    int regardless of which concrete Python type carries it.
+    """
+    return np.int64(value)  # type: ignore[return-value]
+
+
+WHITE = i64(0)
+BLACK = i64(1)
 
 PAWN = 0
 KNIGHT = 1
