@@ -31,7 +31,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 
 import bitboard as bbm
-import movegen as mg
 import search as sr
 
 POSITIONS = {
@@ -59,7 +58,7 @@ def run_fixed_time(fen: str, seconds: float) -> tuple[int, int, float]:
     start = time.perf_counter()
     while True:
         counters = sr.new_counters()
-        f, t, p, score, completed = sr.search_root(
+        _f, _t, _p, score, completed = sr.search_root(
             bb, meta, depth, deadline, counters, -1, -1, -1,
             history, 1, opponent_history, 0,
             *tt,
@@ -71,7 +70,7 @@ def run_fixed_time(fen: str, seconds: float) -> tuple[int, int, float]:
             break
         depth_reached = depth
         prev_score = score
-        if time.perf_counter() >= deadline or abs(score) >= sr.MATE_THRESHOLD:
+        if time.perf_counter() >= deadline or abs(score) >= sr.MATE - 64:
             break
         depth += 1
     elapsed = time.perf_counter() - start

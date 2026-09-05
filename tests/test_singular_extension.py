@@ -91,7 +91,7 @@ def main() -> None:
     if root_slot_written:
         print("  FAIL: an excluded node must never store to the TT under its own position's key")
         failures += 1
-    if not np.any(tt_depth >= 0):
+    if not np.any(tt_depth > 0):
         print("  FAIL: expected the excluded search's own real-move children to still write "
               "their own (different) positions to the TT")
         failures += 1
