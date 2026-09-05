@@ -846,14 +846,14 @@ def negamax(
             if hit:
                 return s
 
-    from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
-    if count == 0:
-        return -MATE if is_check(bb, meta) else 0
-
     if depth <= 0:
         return quiescence(
             bb, meta, alpha, beta, deadline, counters, QUIESCENCE_MAX_PLIES, QSEARCH_CHECK_BUDGET
         )
+
+    from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
+    if count == 0:
+        return -MATE if is_check(bb, meta) else 0
 
     in_check = is_check(bb, meta)
 

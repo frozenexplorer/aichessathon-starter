@@ -10,8 +10,13 @@ stays jit-friendly. MAX_MOVES is well above the theoretical maximum legal moves 
 chess position (218).
 """
 
+from typing import Any
+
+import llvmlite.ir as _ir  # type: ignore[import-untyped]
 import numpy as np
 from numba import njit
+from numba.core import types as _nbtypes
+from numba.extending import intrinsic
 
 from attacks import KING_ATTACKS, KNIGHT_ATTACKS, PAWN_ATTACKS, bishop_attacks, rook_attacks
 from bitboard import BISHOP, BLACK, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE, i64
@@ -123,24 +128,55 @@ def piece_type_at(bb: np.ndarray, color: int, square: int) -> int:
     return -1
 
 
+@intrinsic
+def _llvm_ctpop64(typingctx: Any, val: Any) -> Any:
+    """`llvm.ctpop.i64` -- population count in one instruction instead of a Kernighan loop.
+    Typed as returning `int64` (not `uint64`) directly -- unifying a `uint64`-typed result with the
+    plain `int64` literal `-1` in `_bit_scan`'s other return branch made numba widen the whole
+    function's return type to `float64` (verified: a bare `int(uint64_var)` cast unifies with `-1`
+    the same way, so this is a general numba quirk, not specific to `intrinsic`); returning `int64`
+    from the codegen sidesteps the unification entirely.
+    """
+    sig = _nbtypes.int64(_nbtypes.uint64)
+
+    def codegen(context: Any, builder: Any, signature: Any, args: Any) -> Any:
+        return builder.ctpop(args[0])
+
+    return sig, codegen
+
+
+@intrinsic
+def _llvm_cttz64(typingctx: Any, val: Any) -> Any:
+    """`llvm.cttz.i64` -- index of the lowest set bit in one instruction instead of a linear scan.
+    Result is undefined (per the LLVM intrinsic contract) when `val` is zero -- callers must check
+    for zero themselves, which `_bit_scan` below does. See `_llvm_ctpop64` above for why this
+    returns `int64` rather than `uint64`.
+    """
+    sig = _nbtypes.int64(_nbtypes.uint64)
+
+    def codegen(context: Any, builder: Any, signature: Any, args: Any) -> Any:
+        is_zero_undef = _ir.Constant(_ir.IntType(1), 0)
+        return builder.cttz(args[0], is_zero_undef)
+
+    return sig, codegen
+
+
 @njit(cache=False)
 def _popcount64(bits: np.uint64) -> int:
-    count = 0
-    while bits:
-        bits &= bits - ONE
-        count += 1
-    return count
+    return _llvm_ctpop64(np.uint64(bits))  # type: ignore[call-arg]
 
 
 @njit(cache=False)
 def _bit_scan(bits: np.uint64) -> int:
     """Index of the lowest set bit, or -1 if `bits` is zero. Shared home for what used to be two
     separate copies (search.py and evaluate.py both had their own) -- see docs/plan.md Phase 1.7.
+    Phase 2.2 swapped the bodies of both this and `_popcount64` for single-instruction LLVM
+    intrinsics (`llvm.cttz`/`llvm.ctpop`) in place of a 64-iteration scan / Kernighan loop --
+    see `tests/test_bit_ops.py` for the differential check against the old implementations.
     """
-    for square in range(64):
-        if bits & (ONE << np.uint64(square)):
-            return square
-    return -1
+    if bits == 0:
+        return -1
+    return _llvm_cttz64(np.uint64(bits))  # type: ignore[call-arg]
 
 
 @njit(cache=False)
