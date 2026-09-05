@@ -119,23 +119,6 @@ Depth extends, never ply: the TT still stores against the exact depth value pass
 so a cached entry is always compared like-for-like regardless of how much extension went into
 reaching it, and the mate-distance adjustment (keyed on ply, not depth) is unaffected either way.
 
-Singular extensions: at a deep enough node (SE_MIN_DEPTH) with a hash move backed by a deep,
-trustworthy TT entry (SE_TT_DEPTH_MARGIN, and not merely an upper bound), a verification search of
-this exact node's *other* moves -- at (depth - 1) // 2, in a narrow window just below the hash
-move's own stored score (SE_MARGIN_PER_DEPTH * depth) -- checks whether any of them can even come
-close. If none can, the hash move is "singular" (clearly better than every alternative this search
-can see) and its own child gets the same one-ply extension search extensions above already give a
-checking move, so the search commits real depth to confirming a move the ordering already trusts
-rather than assuming the trust is warranted. Implemented via excluded_from/excluded_to: a per-node
-exclusion, not inherited by any recursive call the excluded search itself makes (its own null-move,
-IID, and move-loop children all pass -1, -1, same as every ordinary node) -- so nesting is
-impossible by construction (the trigger itself also requires excluded_from < 0, belt and braces).
-An excluded node must never resolve via its own TT entry (that entry was written for the *whole*
-move set, not the one this search is deliberately missing) or write one either: both the
-early-return in _tt_resolve's caller and the end-of-function store are skipped whenever
-excluded_from >= 0, so the real TT entry for this position is exactly as if the verification search
-had never run.
-
 Futility pruning: at a shallow node (depth <= FUTILITY_MAX_DEPTH) not in check, a quiet, non-check
 move is skipped outright once the static eval plus a depth-scaled margin still can't reach alpha
 -- the position already looks bad enough that a quiet move is very unlikely to save it, so the
@@ -313,15 +296,6 @@ RFP_MARGIN = 90
 STATIC_EVAL_MAX_DEPTH = 6  # max(RFP_MAX_DEPTH, FUTILITY_MAX_DEPTH) -- shared static-eval gate
 LMP_MAX_DEPTH = 4
 LMP_THRESHOLD = np.array([0, 6, 10, 15, 21], dtype=np.int64)
-
-# Singular extensions: only at a node deep enough (SE_MIN_DEPTH) that the extra verification
-# search below is worth its own cost, with a hash move backed by a TT entry both deep enough
-# (within SE_TT_DEPTH_MARGIN of the current depth) and trustworthy (not merely an upper bound).
-# SE_MARGIN_PER_DEPTH sets how far below the hash move's own score every alternative must fail to
-# count as "singular". See this module's docstring for the excluded-move mechanism this needs.
-SE_MIN_DEPTH = 7
-SE_TT_DEPTH_MARGIN = 3
-SE_MARGIN_PER_DEPTH = 2
 
 # Fifty-move rule: 100 plies (50 full moves by each side) with no pawn move and no capture is an
 # automatic draw. See this module's docstring for where the running count comes from and why.
@@ -733,8 +707,6 @@ def negamax(
     parent_from: int,
     parent_to: int,
     halfmove_clock: int,
-    excluded_from: int,
-    excluded_to: int,
 ) -> int:
     counters[0] += 1
     if _time_up(deadline, counters):
@@ -765,33 +737,26 @@ def negamax(
     slot_a = bucket * 2
     slot_b = slot_a + 1
     hint_from, hint_to, hint_promo = -1, -1, -1
-    hint_tt_depth, hint_tt_score, hint_tt_flag = -1, 0, int(TT_EXACT)
     if tt_key[slot_a] == h:
         hint_from, hint_to, hint_promo = int(tt_from[slot_a]), int(tt_to[slot_a]), int(
             tt_promo[slot_a]
         )
-        hint_tt_depth, hint_tt_score, hint_tt_flag = (
-            int(tt_depth[slot_a]), int(tt_score[slot_a]), int(tt_flag[slot_a]),
+        hit, s, alpha, beta = _tt_resolve(
+            int(tt_depth[slot_a]), int(tt_score[slot_a]), int(tt_flag[slot_a]), depth, ply,
+            alpha, beta,
         )
-        if excluded_from < 0:
-            hit, s, alpha, beta = _tt_resolve(
-                hint_tt_depth, hint_tt_score, hint_tt_flag, depth, ply, alpha, beta,
-            )
-            if hit:
-                return s
+        if hit:
+            return s
     elif tt_key[slot_b] == h:
         hint_from, hint_to, hint_promo = int(tt_from[slot_b]), int(tt_to[slot_b]), int(
             tt_promo[slot_b]
         )
-        hint_tt_depth, hint_tt_score, hint_tt_flag = (
-            int(tt_depth[slot_b]), int(tt_score[slot_b]), int(tt_flag[slot_b]),
+        hit, s, alpha, beta = _tt_resolve(
+            int(tt_depth[slot_b]), int(tt_score[slot_b]), int(tt_flag[slot_b]), depth, ply,
+            alpha, beta,
         )
-        if excluded_from < 0:
-            hit, s, alpha, beta = _tt_resolve(
-                hint_tt_depth, hint_tt_score, hint_tt_flag, depth, ply, alpha, beta,
-            )
-            if hit:
-                return s
+        if hit:
+            return s
 
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     if count == 0:
@@ -843,14 +808,14 @@ def negamax(
             ply + 1, history, child_hist_len,
             tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
             killer_from, killer_to, killer_promo, history_table, False, ext_budget,
-            counter_from, counter_to, counter_promo, -1, -1, halfmove_clock + 1, -1, -1,
+            counter_from, counter_to, counter_promo, -1, -1, halfmove_clock + 1,
         )
         if counters[1]:
             return 0
         if null_score >= beta:
             return beta
 
-    if hint_from < 0 and depth >= IID_MIN_DEPTH and not in_check and excluded_from < 0:
+    if hint_from < 0 and depth >= IID_MIN_DEPTH and not in_check:
         # No hash move to order with, and deep enough that ordering is worth paying for: search
         # this same node at a reduced depth purely to populate one. The recursive call's own TT
         # store (same h, keyed off the exact same position) is the return channel -- re-probing
@@ -861,7 +826,6 @@ def negamax(
             hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
             killer_from, killer_to, killer_promo, history_table, allow_null, ext_budget,
             counter_from, counter_to, counter_promo, parent_from, parent_to, halfmove_clock,
-            -1, -1,
         )
         if counters[1]:
             return 0
@@ -869,38 +833,10 @@ def negamax(
             hint_from, hint_to, hint_promo = int(tt_from[slot_a]), int(tt_to[slot_a]), int(
                 tt_promo[slot_a]
             )
-            hint_tt_depth, hint_tt_score, hint_tt_flag = (
-                int(tt_depth[slot_a]), int(tt_score[slot_a]), int(tt_flag[slot_a]),
-            )
         elif tt_key[slot_b] == h:
             hint_from, hint_to, hint_promo = int(tt_from[slot_b]), int(tt_to[slot_b]), int(
                 tt_promo[slot_b]
             )
-            hint_tt_depth, hint_tt_score, hint_tt_flag = (
-                int(tt_depth[slot_b]), int(tt_score[slot_b]), int(tt_flag[slot_b]),
-            )
-
-    singular_extension = False
-    if (
-        excluded_from < 0
-        and hint_from >= 0
-        and depth >= SE_MIN_DEPTH
-        and hint_tt_depth >= depth - SE_TT_DEPTH_MARGIN
-        and hint_tt_flag != TT_UPPER
-        and -MATE_STORE_THRESHOLD < hint_tt_score < MATE_STORE_THRESHOLD
-    ):
-        singular_beta = hint_tt_score - SE_MARGIN_PER_DEPTH * depth
-        verify_score = negamax(
-            bb, meta, (depth - 1) // 2, singular_beta - 1, singular_beta, deadline, counters,
-            ply, history, hist_len,
-            tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-            killer_from, killer_to, killer_promo, history_table, False, ext_budget,
-            counter_from, counter_to, counter_promo, parent_from, parent_to, halfmove_clock,
-            hint_from, hint_to,
-        )
-        if counters[1]:
-            return 0
-        singular_extension = verify_score < singular_beta
 
     k1_from = int(killer_from[ply, 0])
     k1_to, k1_promo = int(killer_to[ply, 0]), int(killer_promo[ply, 0])
@@ -927,8 +863,6 @@ def negamax(
     for oi in range(count):
         idx = order[oi]
         f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
-        if excluded_from >= 0 and f == excluded_from and t == excluded_to:
-            continue
         is_cap = is_capture(bb, meta, f, t)
         moved_pawn = piece_type_at(bb, meta[0], f) == PAWN
         child_halfmove_clock = 0 if (is_cap or moved_pawn) else halfmove_clock + 1
@@ -942,14 +876,12 @@ def negamax(
             child_ext_budget = ext_budget
 
         if oi == 0:
-            if singular_extension and child_depth == depth - 1 and f == hint_from and t == hint_to:
-                child_depth = depth
             score = -negamax(
                 new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters,
                 ply + 1, history, child_hist_len,
                 tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                 killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
             )
         else:
             if futile and p < 0 and not gives_check and not is_cap:
@@ -990,7 +922,7 @@ def negamax(
                 ply + 1, history, child_hist_len,
                 tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                 killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
             )
             if not counters[1] and reduction > 0 and score > alpha:
                 # the reduced-depth probe suggested this late, quiet move might actually be
@@ -1001,7 +933,7 @@ def negamax(
                     ply + 1, history, child_hist_len,
                     tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                     killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                    counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                    counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
                 )
             if not counters[1] and alpha < score < beta:
                 score = -negamax(
@@ -1009,7 +941,7 @@ def negamax(
                     ply + 1, history, child_hist_len,
                     tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                     killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                    counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                    counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
                 )
         if counters[1]:
             return 0
@@ -1048,34 +980,30 @@ def negamax(
     # Two-tier replacement: prefer the depth-preferred slot on a same-key refresh, an empty slot
     # (depth == -1, the new_tt() sentinel), or a search that went at least as deep as what is
     # already there; otherwise fall back to the always-replace slot so this node's result is
-    # still cached even though it didn't earn the depth-preferred one. Skipped entirely for an
-    # excluded-move search: that result reflects only the moves other than excluded_from/to, not
-    # this position's real value, so storing it under the position's real key would corrupt every
-    # future non-excluded probe of it.
-    if excluded_from < 0:
-        if tt_key[slot_a] == h or tt_depth[slot_a] < 0 or depth >= tt_depth[slot_a]:
-            write_idx = slot_a
-        else:
-            write_idx = slot_b
+    # still cached even though it didn't earn the depth-preferred one.
+    if tt_key[slot_a] == h or tt_depth[slot_a] < 0 or depth >= tt_depth[slot_a]:
+        write_idx = slot_a
+    else:
+        write_idx = slot_b
 
-        tt_key[write_idx] = h
-        tt_depth[write_idx] = depth
-        if best >= MATE_STORE_THRESHOLD:
-            tt_score[write_idx] = best + ply
-        elif best <= -MATE_STORE_THRESHOLD:
-            tt_score[write_idx] = best - ply
-        else:
-            tt_score[write_idx] = best
-        if best <= orig_alpha:
-            tt_flag[write_idx] = TT_UPPER
-        elif best >= beta:
-            tt_flag[write_idx] = TT_LOWER
-        else:
-            tt_flag[write_idx] = TT_EXACT
-        if best_idx != -1:
-            tt_from[write_idx] = np.int8(from_arr[best_idx])
-            tt_to[write_idx] = np.int8(to_arr[best_idx])
-            tt_promo[write_idx] = np.int8(promo_arr[best_idx])
+    tt_key[write_idx] = h
+    tt_depth[write_idx] = depth
+    if best >= MATE_STORE_THRESHOLD:
+        tt_score[write_idx] = best + ply
+    elif best <= -MATE_STORE_THRESHOLD:
+        tt_score[write_idx] = best - ply
+    else:
+        tt_score[write_idx] = best
+    if best <= orig_alpha:
+        tt_flag[write_idx] = TT_UPPER
+    elif best >= beta:
+        tt_flag[write_idx] = TT_LOWER
+    else:
+        tt_flag[write_idx] = TT_EXACT
+    if best_idx != -1:
+        tt_from[write_idx] = np.int8(from_arr[best_idx])
+        tt_to[write_idx] = np.int8(to_arr[best_idx])
+        tt_promo[write_idx] = np.int8(promo_arr[best_idx])
 
     return best
 
@@ -1206,21 +1134,21 @@ def _search_root_pass(
                 new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters, 1, history,
                 hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                 killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
             )
         else:
             score = -negamax(
                 new_bb, new_meta, child_depth, -alpha - 1, -alpha, deadline, counters, 1, history,
                 hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                 killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
             )
             if not counters[1] and alpha < score < beta:
                 score = -negamax(
                     new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters, 1, history,
                     hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
                     killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
-                    counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                    counter_from, counter_to, counter_promo, f, t, child_halfmove_clock,
                 )
         if counters[1]:
             return best_from, best_to, best_promo, best_score, False

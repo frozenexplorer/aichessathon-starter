@@ -4,20 +4,24 @@ Ranked by strength-gained-per-day-of-effort given the 2026-09-11 11:00 London de
 raw impact alone. Tier 1 (transposition table, killer/history move ordering, PVS, DTZ tablebase,
 tapered/richer evaluation) and Tier 2 (items 1-7 below) are both shipped; see `docs/STATUS.md`
 for what each covers and the current verified state, including why items 8-10 remain undone for
-reasons specific to each, not time pressure. Tiers 3-13 are further passes shipped on top of this
+reasons specific to each, not time pressure. Tiers 3-12 are further passes shipped on top of this
 list, none of them part of the original prioritization here -- see `docs/STATUS.md`'s own
-Tier 3 through Tier 13 sections for what each covers (in short: Tier 3 mobility/futility/bigger
+Tier 3 through Tier 12 sections for what each covers (in short: Tier 3 mobility/futility/bigger
 TT/IID/counter-move/delta pruning; Tier 4 endgame-specific eval; Tier 5 threat/pin/x-ray eval;
 Tier 6 a quiescence-in-check search bug fix; Tier 7 history malus; Tier 8 king safety eval;
 Tier 9 reverse-futility and late-move pruning; Tier 10 fifty-move-rule draw detection; Tier 11
-insufficient-material draw detection; Tier 12 a timeman move-overhead safety margin; Tier 13
-singular extensions). Re-run the full gate -- `tests/perft.py`, `tests/test_repetition.py`,
+insufficient-material draw detection; Tier 12 a timeman move-overhead safety margin). Singular
+extensions was also implemented and verified as Tier 13, then deliberately reverted once real
+platform init-time numbers made it the highest-cost, lowest-return item to keep -- see
+`docs/STATUS.md`'s "Tier 13: implemented, then reverted for init time" section for the
+investigation and why. Re-run the full gate -- `tests/perft.py`, `tests/test_repetition.py`,
 `tests/test_see.py`, `tests/test_magic_attacks.py`, `tests/test_threats.py`,
 `tests/test_quiescence_check.py`, `tests/test_king_safety.py`, `tests/test_fifty_move.py`,
-`tests/test_insufficient_material.py`, `tests/test_timeman.py`, `tests/test_singular_extension.py`,
-`ruff`, and `mypy --strict` -- after any change to `search.py`, `movegen.py`, `attacks.py`,
-`evaluate.py`, or `timeman.py`. Do not gate on local init-time measurements (see
-`docs/STATUS.md`'s final call on this).
+`tests/test_insufficient_material.py`, `tests/test_timeman.py`, `ruff`, and `mypy --strict` --
+after any change to `search.py`, `movegen.py`, `attacks.py`, `evaluate.py`, or `timeman.py`. Init
+time is now a real, checked concern again (see `docs/STATUS.md`'s header) rather than something to
+ignore outright -- re-profile with a stage-by-stage warm-up timing if a change might meaningfully
+grow `negamax`/`quiescence`/`search_root`'s own compiled complexity.
 
 1. **[DONE, Tier 2] Adaptive time management** (`timeman.py`) -- the flat `time_left/30 + increment` formula
    gives a razor-sharp middlegame the same budget as a simplified endgame. This is not

@@ -31,7 +31,7 @@ def call_negamax(fen: str) -> int:
         bb, meta, 3, -sr.INF, sr.INF, deadline, counters, 0, history, 0,
         tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
         killer_from, killer_to, killer_promo, history_table, True, sr.MAX_CHECK_EXTENSIONS,
-        counter_from, counter_to, counter_promo, -1, -1, 0, -1, -1,
+        counter_from, counter_to, counter_promo, -1, -1, 0,
     )
 
 
