@@ -76,7 +76,15 @@ from attacks import (
     rook_attacks,
 )
 from bitboard import BISHOP, BLACK, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE
-from movegen import SQUARE_COLOR_MASK, attacked_by, king_square, occ_color, piece_type_at
+from movegen import (
+    SQUARE_COLOR_MASK,
+    _bit_scan,
+    _popcount64,
+    attacked_by,
+    king_square,
+    occ_color,
+    piece_type_at,
+)
 
 PIECE_VALUE = np.array([100, 320, 330, 500, 900, 0], dtype=np.int32)
 
@@ -254,15 +262,6 @@ KING_SHIELD_BLACK = _build_king_shield_masks(False)
 
 
 @njit(cache=False)
-def _popcount64(bits: np.uint64) -> int:
-    count = 0
-    while bits:
-        bits &= bits - ONE
-        count += 1
-    return count
-
-
-@njit(cache=False)
 def game_phase(bb: np.ndarray) -> int:
     phase = 0
     for color in range(2):
@@ -436,14 +435,6 @@ def mobility_score(bb: np.ndarray) -> int:
 
 
 @njit(cache=False)
-def _bit_scan(bits: np.uint64) -> int:
-    for square in range(64):
-        if bits & (ONE << np.uint64(square)):
-            return square
-    return -1
-
-
-@njit(cache=False)
 def threats_score(bb: np.ndarray) -> int:
     """A pawn attacking a more valuable piece, any piece attacking an undefended enemy piece, and
     a fork bonus when one piece attacks two or more enemy pieces (the enemy king included, since
@@ -505,7 +496,7 @@ def threats_score(bb: np.ndarray) -> int:
 
 
 @njit(cache=False)
-def _ray_pin_score(
+def _ray_pin_score_bishop(
     bb: np.ndarray,
     sq: int,
     all_occ: np.uint64,
@@ -513,9 +504,13 @@ def _ray_pin_score(
     enemy_occ: np.uint64,
     enemy: int,
     enemy_king_bb: np.uint64,
-    use_bishop: bool,
 ) -> int:
-    full = bishop_attacks(sq, all_occ) if use_bishop else rook_attacks(sq, all_occ)
+    """Bishop-ray half of pin_and_xray_score's per-slider scan. A single njit-level bool
+    parameter picking bishop_attacks vs rook_attacks here would compile as Literal[bool](True) /
+    Literal[bool](False) -- two full specialisations of what is otherwise the same body -- so this
+    is split into two thin, near-identical functions instead (see docs/plan.md Phase 1.1).
+    """
+    full = bishop_attacks(sq, all_occ)
     candidates = full & enemy_occ & ~enemy_king_bb
     total = 0
     remaining = candidates
@@ -523,12 +518,47 @@ def _ray_pin_score(
         c = _bit_scan(remaining)
         remaining &= remaining - ONE
         occ_without = all_occ & ~(ONE << np.uint64(c))
-        extended = (
-            bishop_attacks(sq, occ_without) if use_bishop else rook_attacks(sq, occ_without)
-        )
+        extended = bishop_attacks(sq, occ_without)
         # Isolate to squares newly reachable now that c is gone -- extended still includes every
         # other ray's original blocker unchanged (e.g. an own piece on a different rank/diagonal),
         # and intersecting the whole thing against occ_without would wrongly pick those up too.
+        revealed = (extended & ~full) & occ_without
+        if revealed == 0 or revealed & own_occ:
+            continue
+        candidate_pt = piece_type_at(bb, enemy, c)
+        if revealed & enemy_king_bb:
+            total += int(PIECE_VALUE[candidate_pt]) // int(PIN_KING_DIVISOR)
+        else:
+            revealed_sq = _bit_scan(revealed)
+            revealed_pt = piece_type_at(bb, enemy, revealed_sq)
+            bonus = int(XRAY_FLAT_BONUS)
+            if PIECE_VALUE[revealed_pt] > PIECE_VALUE[candidate_pt]:
+                diff = int(PIECE_VALUE[revealed_pt]) - int(PIECE_VALUE[candidate_pt])
+                bonus += diff // int(XRAY_HEAVY_DIVISOR)
+            total += bonus
+    return total
+
+
+@njit(cache=False)
+def _ray_pin_score_rook(
+    bb: np.ndarray,
+    sq: int,
+    all_occ: np.uint64,
+    own_occ: np.uint64,
+    enemy_occ: np.uint64,
+    enemy: int,
+    enemy_king_bb: np.uint64,
+) -> int:
+    """Rook-ray half of pin_and_xray_score's per-slider scan -- see _ray_pin_score_bishop."""
+    full = rook_attacks(sq, all_occ)
+    candidates = full & enemy_occ & ~enemy_king_bb
+    total = 0
+    remaining = candidates
+    while remaining:
+        c = _bit_scan(remaining)
+        remaining &= remaining - ONE
+        occ_without = all_occ & ~(ONE << np.uint64(c))
+        extended = rook_attacks(sq, occ_without)
         revealed = (extended & ~full) & occ_without
         if revealed == 0 or revealed & own_occ:
             continue
@@ -569,27 +599,27 @@ def pin_and_xray_score(bb: np.ndarray) -> int:
         while remaining:
             sq = _bit_scan(remaining)
             remaining &= remaining - ONE
-            score += sign * _ray_pin_score(
-                bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb, True
+            score += sign * _ray_pin_score_bishop(
+                bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb
             )
 
         remaining = bb[color * 6 + ROOK]
         while remaining:
             sq = _bit_scan(remaining)
             remaining &= remaining - ONE
-            score += sign * _ray_pin_score(
-                bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb, False
+            score += sign * _ray_pin_score_rook(
+                bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb
             )
 
         remaining = bb[color * 6 + QUEEN]
         while remaining:
             sq = _bit_scan(remaining)
             remaining &= remaining - ONE
-            score += sign * _ray_pin_score(
-                bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb, True
+            score += sign * _ray_pin_score_bishop(
+                bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb
             )
-            score += sign * _ray_pin_score(
-                bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb, False
+            score += sign * _ray_pin_score_rook(
+                bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb
             )
 
     return int(score)
@@ -779,12 +809,3 @@ def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
     score = score * opposite_bishops_scale(bb) // 100
     stm_score = int(score) if meta[0] == WHITE else int(-score)
     return stm_score + int(TEMPO_BONUS)
-
-
-def warm_up() -> None:
-    from bitboard import from_fen
-
-    bb, meta = from_fen(
-        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-    )
-    evaluate(bb, meta)
