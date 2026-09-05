@@ -870,6 +870,23 @@ comfortable under the real 90s cap with far more margin than Tier 16 left. This 
 dev-machine-vs-platform gap this doc's "Known risk: init-time margin" section has documented since
 Tier 1 -- unchanged in kind, just on the right side of it now instead of the wrong one.
 
+**Strength check after the fix, at the real time control:** a 4-game head-to-head, current `main`
+(post-Tier 17) vs the raw Tier 13 baseline (`c5be352`, the same comparison build used in the
+Tier 16 section above), run via a detached `git worktree` rather than a second branch, at the real
+`BASE_MS`/`INCREMENT_MS` contract (120s + 0.5s, not the 25s+0.25s blitz clock every earlier
+head-to-head in this doc used) with the same generous local init budget so neither build was
+disqualified by this dev machine's slower compile. Result: **current +2 =1 -1 (62.5%)** --
+3 games decided by real checkmate on both sides, 1 draw by threefold repetition (as Black, against
+Tier 13, not a lost winning position for current). This reverses the direction of the earlier
+8-game blitz-clock batch referenced in the Tier 16 section (Tier 13 +4 =3 -1 there), consistent
+with that batch's own "could be a fast-time-control artifact" caveat -- current's search stack
+(singular extensions, multi-cut, adaptive LMR, RFP/LMP, all absent from Tier 13) needs the depth a
+slower clock affords to pay for itself, and a 25s blitz clock may simply not give it enough of that
+depth. Sample size is still small (4 games); read this as "Tier 17 did not cost strength and the
+extra tiers on top of Tier 13 look net-positive at a realistic clock," not a settled rating claim --
+a larger (12-20 game) batch at this same real contract would be the next step if this needs to be
+more than directional.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially

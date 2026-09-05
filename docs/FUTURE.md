@@ -20,7 +20,10 @@ plus another TT doubling, multi-cut pruning, adaptive late move reductions, and 
 `bench_nodes.py` benchmarks, found and fixed the real mechanism behind Tier 16's regression
 (duplicate numba specialisations from `Literal[int]`/`int8`-vs-`int64` argument-type drift, not
 function size as earlier tiers assumed), deleted Lazy SMP entirely now that `SMP_THREADS = 1`
-(Tier 16) had made it fully dead code, and shipped precomputed magic attack tables). Tier 13 was
+(Tier 16) had made it fully dead code, and shipped precomputed magic attack tables, then confirmed
+the fix cost no strength with a 4-game real-contract (120s+0.5s) head-to-head vs Tier 13,
++2 =1 -1 -- see `docs/STATUS.md`'s Tier 17 section for why this reverses the earlier blitz-clock
+batch's direction). Tier 13 was
 also trial-reverted and restored in between shipping and Tier 14 -- see `docs/STATUS.md`'s "Known
 risk: init-time margin" section for that whole round trip and why it ended back where it started;
 that same section now also carries Tier 16's confirmation that the real init cap really is 90s, not
