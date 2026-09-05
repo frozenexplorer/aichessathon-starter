@@ -4,9 +4,9 @@ Ranked by strength-gained-per-day-of-effort given the 2026-09-11 11:00 London de
 raw impact alone. Tier 1 (transposition table, killer/history move ordering, PVS, DTZ tablebase,
 tapered/richer evaluation) and Tier 2 (items 1-7 below) are both shipped; see `docs/STATUS.md`
 for what each covers and the current verified state, including why items 8-10 remain undone for
-reasons specific to each, not time pressure. Tiers 3-17 are further passes shipped on top of this
+reasons specific to each, not time pressure. Tiers 3-18 are further passes shipped on top of this
 list, none of them part of the original prioritization here -- see `docs/STATUS.md`'s own
-Tier 3 through Tier 17 sections for what each covers (in short: Tier 3 mobility/futility/bigger
+Tier 3 through Tier 18 sections for what each covers (in short: Tier 3 mobility/futility/bigger
 TT/IID/counter-move/delta pruning; Tier 4 endgame-specific eval; Tier 5 threat/pin/x-ray eval;
 Tier 6 a quiescence-in-check search bug fix; Tier 7 history malus; Tier 8 king safety eval;
 Tier 9 reverse-futility and late-move pruning; Tier 10 fifty-move-rule draw detection; Tier 11
@@ -21,28 +21,38 @@ plus another TT doubling, multi-cut pruning, adaptive late move reductions, and 
 (duplicate numba specialisations from `Literal[int]`/`int8`-vs-`int64` argument-type drift, not
 function size as earlier tiers assumed), deleted Lazy SMP entirely now that `SMP_THREADS = 1`
 (Tier 16) had made it fully dead code, and shipped precomputed magic attack tables, then confirmed
-the fix cost no strength with a 4-game real-contract (120s+0.5s) head-to-head vs Tier 13,
-+2 =1 -1 -- see `docs/STATUS.md`'s Tier 17 section for why this reverses the earlier blitz-clock
-batch's direction). Tier 13 was
-also trial-reverted and restored in between shipping and Tier 14 -- see `docs/STATUS.md`'s "Known
-risk: init-time margin" section for that whole round trip and why it ended back where it started;
-that same section now also carries Tier 16's confirmation that the real init cap really is 90s, not
-the 60s this repo's own `AGENTS.md`/`harness/rules.py` still say (the latter deliberately left
-unedited regardless, per `AGENTS.md`'s own standing rule against ever changing `harness/`), and
-Tier 17's own numbers on where init time actually landed after the fix.
+the fix cost no strength with a 4-game real-contract (120s+0.5s) head-to-head vs Tier 13, +2 =1 -1
+-- see `docs/STATUS.md`'s Tier 17 section for why this reverses the earlier blitz-clock batch's
+direction; Tier 18, `docs/plan.md`'s Phase 2 (node rate, zero init cost, gated purely on
+`tests/bench_nodes.py` plus the correctness suite): skipped a redundant leaf `generate_legal` call
+in `negamax`, real `llvm.ctpop`/`cttz` popcount/bitscan intrinsics, set-bits-only Zobrist hashing,
+an allocation-free occupancy-based SEE rewrite, staged move-ordering selection in place of a full
+`argsort`, deferring `make_move`'s board copy past the futility/LMP prune checks via a cheap
+direct-check-only test, and a handful of ordering fixes (a promotion-scoring bug, deduped
+`is_capture` calls, a tighter branching-factor estimate, a widening aspiration-window ladder) --
+node rate up ~30-55% cumulatively with zero init-time cost, see `docs/STATUS.md`'s Tier 18 section
+for the full breakdown and numbers. Tier 13 was also trial-reverted and restored in between
+shipping and Tier 14 -- see `docs/STATUS.md`'s "Known risk: init-time margin" section for that
+whole round trip and why it ended back where it started; that same section now also carries Tier
+16's confirmation that the real init cap really is 90s, not the 60s this repo's own
+`AGENTS.md`/`harness/rules.py` still say (the latter deliberately left unedited regardless, per
+`AGENTS.md`'s own standing rule against ever changing `harness/`), and Tier 17's own numbers on
+where init time actually landed after the fix.
 Re-run the full gate -- `tests/perft.py`, `tests/test_repetition.py`, `tests/test_see.py`,
 `tests/test_magic_attacks.py`, `tests/test_threats.py`, `tests/test_quiescence_check.py`,
 `tests/test_king_safety.py`, `tests/test_fifty_move.py`, `tests/test_insufficient_material.py`,
 `tests/test_timeman.py`, `tests/test_singular_extension.py`, `tests/test_tempo_and_ocb.py`,
-`ruff`, and `mypy --strict` (explicitly against `movegen.py`/`evaluate.py`/`search.py` too, not
-just the `agent.py`/`harness` the `[tool.mypy]` `files` config covers by default -- still an open
-gap, see `docs/plan.md`) -- after any change to `search.py`, `movegen.py`, `attacks.py`,
-`evaluate.py`, `timeman.py`, or `agent.py`. `tests/test_lazy_smp.py` no longer exists (Tier 17
-deleted it along with the feature it tested). Init time is a real, checked concern again as of
-Tier 13 (see `docs/STATUS.md`'s header), not something to gate on blindly but not something to
-ignore either -- re-profile with `tests/bench_init.py` (Tier 17) if a change might meaningfully
-grow `negamax`/`quiescence`/`search_root`'s own compiled complexity or reintroduce a duplicate
-specialisation, and `tests/bench_nodes.py` for anything touching search/movegen speed.
+`tests/test_bit_ops.py`, `tests/test_zobrist_hash.py` (both Tier 18), `ruff`, and `mypy --strict`
+(explicitly against `movegen.py`/`evaluate.py`/`search.py` too, not just the `agent.py`/`harness`
+the `[tool.mypy]` `files` config covers by default -- still an open gap, see `docs/plan.md`) --
+after any change to `search.py`, `movegen.py`, `attacks.py`, `evaluate.py`, `timeman.py`,
+`zobrist.py`, or `agent.py`. `tests/test_lazy_smp.py` no longer exists (Tier 17 deleted it along
+with the feature it tested). Init time is a real, checked concern again as of Tier 13 (see
+`docs/STATUS.md`'s header), not something to gate on blindly but not something to ignore either --
+re-profile with `tests/bench_init.py` (Tier 17) if a change might meaningfully grow
+`negamax`/`quiescence`/`search_root`'s own compiled complexity or reintroduce a duplicate
+specialisation, and `tests/bench_nodes.py` (Tier 18's own acceptance test) for anything touching
+search/movegen speed.
 
 1. **[DONE, Tier 2] Adaptive time management** (`timeman.py`) -- the flat `time_left/30 + increment` formula
    gives a razor-sharp middlegame the same budget as a simplified endgame. This is not
@@ -146,13 +156,19 @@ specialisation, and `tests/bench_nodes.py` for anything touching search/movegen 
     function is real correctness risk (mutual recursion between njit functions is fragile) for a
     win not currently needed.
 
-12. **[NOT STARTED] `docs/plan.md` Phase 2 (node-rate) and Phase 3 (NNUE)** -- explicitly out of
-    scope for the Tier 17 pass (init-time only). Phase 2 is a set of independent, individually
+12. **[DONE, Tier 18] `docs/plan.md` Phase 2 (node-rate)** -- seven independent, individually
     revertable search/movegen speed items (redundant leaf `generate_legal` in quiescence, real
-    popcount/bitscan via `llvm.ctpop`/`cttz`, incremental Zobrist hashing, allocation-free SEE,
-    staged move-ordering selection instead of a full `argsort`, and a handful of small ordering/
-    pruning bug fixes) accepted or rejected one at a time against `tests/bench_nodes.py` plus an
-    arena run. Phase 3 is a trained NNUE spending the ~43MB of zip headroom left after
-    `weights/syzygy/` and the new `weights/attacks.npz` (Tier 17) -- the biggest strength ceiling
-    available, but multi-day and shipped only if it beats the handcrafted eval over a real arena
-    run. See `docs/plan.md` for the full writeup of both.
+    popcount/bitscan via `llvm.ctpop`/`cttz`, set-bits-only Zobrist hashing, an allocation-free
+    occupancy-based SEE rewrite, staged move-ordering selection instead of a full `argsort`,
+    deferring `make_move`'s board copy past the futility/LMP prune checks, and a handful of small
+    ordering/correctness fixes), each accepted only on `tests/bench_nodes.py` plus the correctness
+    suite. Node rate up ~30-55% cumulatively, zero init-time cost -- see `docs/STATUS.md`'s Tier 18
+    section for the full breakdown and numbers, `docs/plan.md` for the original writeup.
+
+13. **[NOT STARTED] `docs/plan.md` Phase 3 (trained NNUE)** -- explicitly deferred behind Phase 2
+    per the plan's own sequencing. Spends the ~43MB of zip headroom left after `weights/syzygy/`
+    and `weights/attacks.npz` (Tier 17) -- the biggest strength ceiling available, but multi-day
+    (self-play or externally-annotated training data, PyTorch training offline, quantised `int16`
+    export, an njit inference forward pass -- never torch/onnxruntime at inference time, per-node
+    call overhead would be fatal inside a search doing 100k+ nodes) and shipped only if it beats the
+    handcrafted eval over a real arena run (>=40 games). See `docs/plan.md` for the full writeup.

@@ -887,6 +887,90 @@ extra tiers on top of Tier 13 look net-positive at a realistic clock," not a set
 a larger (12-20 game) batch at this same real contract would be the next step if this needs to be
 more than directional.
 
+## Tier 18: Phase 2 node-rate work -- same speed, more of it per second
+
+`docs/plan.md`'s Phase 2 (explicitly out of scope for Tier 17, which was init-time only): a set of
+independent, individually revertable search/movegen speed items, each accepted only on
+`tests/bench_nodes.py` plus the correctness suite -- no init-time cost, since none of it touches
+what compiles, only what the already-compiled code does per node.
+
+- **2.1 Redundant leaf `generate_legal`.** `negamax`'s `depth <= 0` branch called `generate_legal`
+  (a full `make_move`-and-`attacked_by` pass per pseudo-legal move) only to check `count == 0`
+  before handing off to `quiescence`, which repeats both the generation and the mate/stalemate
+  check itself. Moved the `depth <= 0` return above that call -- behaviour-identical, since
+  quiescence's own checks are unconditional either way, and leaves are the majority of nodes.
+- **2.2 Real popcount/bitscan.** `movegen._popcount64` (a Kernighan loop) and `_bit_scan` (a linear
+  0-63 scan) sit in the hot loops of seven `evaluate.py` terms, `zobrist.position_hash`, and SEE.
+  Replaced both with single-instruction `llvm.ctpop`/`llvm.cttz` via `numba.extending.intrinsic`
+  (llvmlite's `IRBuilder.ctpop`/`.cttz` helpers, not a hand-written `declare_intrinsic` call, which
+  crashed the LLVM verifier outright on first attempt). One real trap along the way: the intrinsic
+  originally returned `uint64`, and unifying that with the plain `int64` literal `-1` in
+  `_bit_scan`'s zero-input branch silently widened the *whole function's* return type to `float64`
+  (reproduced with a bare `int(uint64_var)` cast too, so this is a general numba quirk, not specific
+  to `intrinsic` -- caught by the new `tests/test_bit_ops.py` differential test, not by inspection).
+  Fixed by declaring the intrinsics `int64`-returning directly. New `tests/test_bit_ops.py` checks
+  both against a plain-Python reference over 10,000+ random 64-bit values plus edge cases (0,
+  all-ones, every single-bit value).
+- **2.3 Zobrist set-bits-only iteration.** `position_hash` scanned all 64 squares of all 12
+  bitboards on every negamax node regardless of occupancy; now iterates only set bits via the 2.2
+  bitscan (~32 iterations for a full board). New `tests/test_zobrist_hash.py` checks it against the
+  old full-scan algorithm over 8 real FENs (opening through endgame, en-passant- and
+  castling-eligible) as a differential oracle.
+- **2.4 Allocation-free SEE.** `see()` used to `bb.copy()` the whole 12-bitboard board per call (once
+  per capture scored at every node, again per capture in quiescence) purely to track which pieces
+  had been spent in the exchange. Rewritten to the standard occupancy-based swap algorithm: a single
+  `occ` bitboard mutated in place (bits cleared as pieces are used), with `_see_least_valuable_
+  attacker` reading the original, unmutated per-type bitboards masked by `occ` instead of a mutated
+  copy of the board. `tests/test_see.py`'s five hand-computed exchanges (including the x-ray case)
+  all still agree exactly.
+- **2.5 Staged move selection.** `negamax`'s and `quiescence`'s move loops replaced a single
+  `np.argsort(-scores)` up front with `_argmax` picking the next-best remaining move one at a time --
+  most nodes fail high on the first few moves and never need the rest ordered at all, so this turns
+  an always-paid O(n log n) sort into work proportional to how many moves a node actually examines.
+  `search_root`'s own `argsort` was deliberately left alone: root explores every move regardless (no
+  early cutoff possible), so staging has nothing to gain there and would only replace one O(n log n)
+  sort with an O(n^2) one.
+- **2.6 Deferred `make_move` for pruned moves.** Futility and late-move pruning both used to pay for
+  `make_move` (a full board copy) plus `is_check` on *every* move just to learn `gives_check`, most
+  of the time only to then skip the move anyway. New `_gives_check_direct` -- the moved piece's own
+  attack pattern against the enemy king from its destination square, using post-move occupancy
+  updated as a single scalar rather than a new board -- gates both prunes instead: a pruned move now
+  never pays for a board copy. Deliberately misses discovered checks (a piece moving off a line that
+  unveils a different piece's attack); accepted, because it only gates two prune *heuristics*, never
+  search accuracy or check-extension eligibility, both of which still use the real, accurate
+  `make_move` + `is_check` on every move that actually gets searched.
+- **2.7 Small ordering/correctness fixes.** `is_capture` was being recomputed up to three times per
+  cutoff move (once for the current move, once at the cutoff check, once per earlier move in the
+  history-malus backward pass) -- now cached once per move (`move_is_cap`, indexed by search
+  position now that 2.5 removed the materialised `order` array) and read back everywhere else. A
+  non-capturing promotion's move-ordering score was `500 + PIECE_VALUE[promo]` (<=1400 for a queen),
+  below killers (5001/5002) and any quiet move with real history, and permanently stuck there since
+  `_score_moves2`'s `base != 0` short-circuit meant it could never also pick up a killer/history
+  bonus -- raised to `PROMOTION_BASE` (9000) `+ PIECE_VALUE[promo]`, above killers/counter-move/
+  history and below the capture floor, where it belongs. `BRANCHING_ESTIMATE` (the early-stop
+  multiplier for whether the next iterative-deepening depth has a real chance of finishing) was 4
+  when the real effective branching factor with this move ordering is 2-3, so it almost never
+  actually fired -- lowered to 2.5. Aspiration windows used to jump straight from a +-50 window to
+  the full `-INF..INF` on any fail-high/fail-low; now widen +-50 -> +-200 -> full, so a score that
+  moved by a little more than 50 does not throw away a whole re-search's worth of the previous
+  pass's ordering for nothing.
+
+**Verified:** `ruff`/`mypy --strict` clean; `tests/perft.py` (0 mismatches, all depths); all 13
+existing `tests/*.py` scripts plus the two new ones (`test_bit_ops.py`, `test_zobrist_hash.py`)
+pass; `tests/bench_init.py` shows **84.78s total, zero duplicate specialisations** (actually down
+slightly from Tier 17's ~88-91s, since 2.7's `_gives_check_direct` and `_argmax` additions are
+smaller than what they let other code skip) -- Phase 2 does not touch init time by design.
+`tests/bench_nodes.py`, the actual acceptance metric, is up **~30-55% cumulatively** over the
+pre-Phase-2 baseline: blunder 30,042 -> 39,313 nodes/s, quiet 27,838 -> 43,268 nodes/s, endgame
+110,028 -> 156,837 nodes/s. A gate-equivalent run (raised local init budget in memory only, per the
+same monkeypatch approach Tier 17's own real-contract head-to-head used -- `harness/` itself never
+edited) went 2/2 vs `baselines/random` and 6/6 vs `baselines/greedy`, all decided by real
+checkmate, no crashes.
+
+**Not done: Phase 3 (trained NNUE)** -- explicitly out of scope for this pass per `docs/plan.md`'s
+own sequencing ("Phase 3, flagged, shipped only on arena evidence" -- see Sequencing item 7 there).
+Multi-day scope against the runway remaining; picked up separately if there is time to spare.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -1134,3 +1218,15 @@ pawn" eval term were both explicitly declined -- see Tier 16's own section for w
 it rather than time pressure. Measured head-to-head against the pre-Tier-13-restore build across a
 2-game and a 10-game local match (+5 =4 -3 combined) -- the first batch in this whole investigation
 to outscore that baseline; see Tier 16's section for the sample-size caveats.
+
+A fifth round followed `docs/plan.md`, split deliberately into two phases by risk: Tier 17 (Phase 1,
+init-time recovery -- Tier 16 had pushed init time over budget, and this repo had no committed
+benchmark of any kind to catch it) found and fixed the real mechanism (duplicate numba
+specialisations, not function size as every earlier tier's own init-time notes above assumed),
+confirmed with a real-contract head-to-head that the fix cost no strength, then Tier 18 (Phase 2,
+node rate at zero init cost, gated purely on `tests/bench_nodes.py` plus the correctness suite)
+picked up seven independent speed items -- see each tier's own section above for the full
+writeup and numbers. `docs/plan.md`'s Phase 3 (a trained NNUE spending the ~43MB of zip headroom
+Tier 17 confirmed is available) remains not started -- multi-day scope, shipped only on real arena
+evidence per the plan's own acceptance criterion, picked up only if there is runway to spare once
+everything else here is done.
