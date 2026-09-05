@@ -230,6 +230,34 @@ treats insufficient material as an automatic, non-claim terminal condition on th
 played -- it exists purely so the search's own evaluation of a hypothetical such position reached
 while descending the tree is accurate rather than running ordinary material/PST/threat scoring on
 a position that is provably a dead draw.
+
+Lazy SMP: search_root is decorated nogil=True (confirmed to actually release the GIL for real
+multi-core execution on this numba version, not just in theory -- verified with a standalone
+synthetic-workload benchmark before touching this decorator) so agent.py can run several concurrent
+calls to it from separate Python threads, all sharing one transposition table, while each thread
+gets its own independent history/opponent_history copy, killer table, history-heuristic table, and
+counter-move table (see agent.py's own docstring for exactly which arrays are shared vs per-thread
+and why). Only search_root needs the decorator, not negamax/quiescence/evaluate/etc: numba resolves
+an njit-to-njit call as a direct native call at the CALLEE's own compile time, not through the
+Python-facing dispatcher wrapper that nogil actually controls, so nogil is only meaningful on the
+one function ever invoked directly from Python -- confirmed with a standalone probe (mutate a
+global read by a leaf function two calls deep, recompile only that leaf and its direct caller,
+observe the change propagate with no need to touch anything above them) before relying on it here.
+_search_restricted (agent.py's tablebase-narrowed endgame path) is deliberately left
+single-threaded for now, calling negamax directly exactly as before -- Lazy SMP is scoped to the
+main search path only for this first pass.
+
+Sharing the TT array across threads without locks is a deliberate, standard "Lazy SMP" tradeoff,
+not an oversight: a torn read (one thread reading a slot mid-write by another) can only ever
+produce the same class of "wrong info" a single-threaded run already has to tolerate from an
+ordinary hash-index collision between two unrelated positions -- a hint move that does not match
+any move in the current position's own generated legal-move list, which move ordering already must
+skip harmlessly rather than trust blindly, collision or not. tt_from/tt_to/tt_promo are single-byte
+(int8) fields, so a torn read of any one of them individually is not even possible on real
+hardware; tt_key is a naturally-aligned 8-byte word, atomic on every mainstream x86-64/ARM64 target
+in practice (not guaranteed by the language spec, universally relied on by real engines that do
+this). Nothing shared here can mask a real repetition or corrupt the claim-eligibility safety net
+-- both read from the independent, per-thread history arrays, never the TT.
 """
 
 import time
@@ -1240,7 +1268,7 @@ def _search_root_pass(
     return best_from, best_to, best_promo, best_score, True
 
 
-@njit(cache=False)
+@njit(cache=False, nogil=True)
 def search_root(
     bb: np.ndarray,
     meta: np.ndarray,
