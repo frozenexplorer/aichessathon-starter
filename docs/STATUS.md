@@ -1,28 +1,24 @@
 # Status
 
-Handoff snapshot as of the Tier 13-reverted pass (2026-09-05), on top of Tiers 1-12 (Tier 2 commit
-`02ec418`, Tier 1 commit `12a38f9`), all documented in their own sections below. Read this instead
-of replaying the whole build history.
+Handoff snapshot as of the Tier 13 pass, restored after a trial revert (2026-09-05), on top of
+Tiers 1-12 (Tier 2 commit `02ec418`, Tier 1 commit `12a38f9`), all documented in their own sections
+below. Read this instead of replaying the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
 08:00-22:00; Daily Five runs 2026-09-06 through 2026-09-10.
 
-Init time went from "not tracked as a gating concern" (dev-machine numbers assumed not to reflect
-competition hardware, see the policy below and its history) back to a real, actively-managed
-constraint once real platform numbers came in: the actual website reported ~85s init against a 90s
-cap, a 5s margin. That prompted the first actual stage-by-stage profiling pass of `_warm_up()` (not
-done before this point) and the Tier 13 revert documented in its own section below -- read that
-section for the investigation (caching and thread-based parallelism both confirmed dead ends) and
-why singular extensions specifically was the trim. The general policy below (accept dev-machine
-absolute numbers as unreliable) still stands for day-to-day work; it was the arrival of a real,
-non-dev-machine number close to the actual cap that made this one exception actionable.
-
-Each Tier 3+ item below was still verified with the full correctness gate (`ruff`, `mypy --strict`,
-`tests/perft.py`, `tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`,
-from Tier 5 onward `tests/test_threats.py`, from Tier 6 onward `tests/test_quiescence_check.py`,
-from Tier 8 onward `tests/test_king_safety.py`, from Tier 10 onward `tests/test_fifty_move.py`,
-from Tier 11 onward `tests/test_insufficient_material.py`, and from Tier 12 onward
-`tests/test_timeman.py`) plus functional games (checkmates from the start position and the
-KBN-vs-K tablebase endgame, both colours) before moving to the next.
+Init time on this dev machine is not assumed to reflect the actual competition hardware as a
+matter of policy (see "Known risk: init-time margin" below), but real platform numbers did arrive
+during Tier 13 (~85s init against a real 90s cap) and briefly made this a live decision rather than
+a purely theoretical one -- see that same section for the profiling, the trial removal of singular
+extensions, the head-to-head match that measured its real strength cost, and why it was restored
+rather than left out. Each Tier 3+ item below was still verified with the full correctness gate
+(`ruff`, `mypy --strict`, `tests/perft.py`,
+`tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`, from Tier 5 onward
+`tests/test_threats.py`, from Tier 6 onward `tests/test_quiescence_check.py`, from Tier 8 onward
+`tests/test_king_safety.py`, from Tier 10 onward `tests/test_fifty_move.py`, from Tier 11 onward
+`tests/test_insufficient_material.py`, from Tier 12 onward `tests/test_timeman.py`, and from
+Tier 13 onward `tests/test_singular_extension.py`) plus functional games (checkmates from the
+start position and the KBN-vs-K tablebase endgame, both colours) before moving to the next.
 
 ## Architecture
 
@@ -48,11 +44,12 @@ zobrist.py      position hashing, for repetition detection and the transposition
 search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table,
                 killer-move + history (with malus) + counter-move ordering, principal variation
                 search (PVS) with aspiration windows, null-move pruning, late move reductions and
-                pruning, check extensions, futility and reverse-futility/static-null pruning,
-                internal iterative deepening, static exchange evaluation (move ordering +
-                quiescence SEE/delta pruning), quiescence (including a bounded full-width search
-                of check evasions, not just captures, when the side to move is in check),
-                repetition-draw scoring, panic-mode fallback
+                pruning, check extensions, singular extensions (excluded-move verification
+                search), futility and reverse-futility/static-null pruning, internal iterative
+                deepening, static exchange evaluation (move ordering + quiescence SEE/delta
+                pruning), quiescence (including a bounded full-width search of check evasions, not
+                just captures, when the side to move is in check), repetition/fifty-move/
+                insufficient-material draw scoring, panic-mode fallback
 tablebase.py    Syzygy WDL + DTZ, root-only -- WDL filters to won/drawn-safe moves, DTZ narrows
                 further to the ones that actually make progress
 timeman.py      per-move budget (adaptive: a volatile position -- score swinging between
@@ -80,6 +77,10 @@ tests/test_insufficient_material.py  is_insufficient_material and negamax's use 
                               recognised dead-draw shapes, three deliberately-unflagged ones
 tests/test_timeman.py        budget_ms/extended_budget_ms's two stacked safety reservations, and
                               sane, non-negative output at very low clock values
+tests/test_singular_extension.py  negamax's excluded-move mechanism: an excluded search still
+                              returns a sane score and never stores to the TT under its own
+                              position's key, while its own real-move children still store to
+                              theirs normally
 ```
 
 Everything under `weights/syzygy/` and every `.py` file above ships in the zip (`make zip`);
@@ -468,6 +469,50 @@ New dedicated test: `tests/test_timeman.py` (this module had none before) -- con
 and that both stay sane (floor at `MIN_BUDGET_MS`, never negative) across a range of very low
 clock values.
 
+## Tier 13: what changed and why
+
+1. **Singular extensions** (`search.py`) -- the last, highest-risk item from the "further ideas"
+   discussion, done last and most carefully for exactly that reason. At a deep enough node
+   (`SE_MIN_DEPTH`) with a hash move backed by a deep, trustworthy TT entry (`SE_TT_DEPTH_MARGIN`,
+   not merely an upper bound), a verification search of this exact node's *other* moves -- at
+   `(depth - 1) // 2`, in a narrow window just below the hash move's own stored score
+   (`SE_MARGIN_PER_DEPTH * depth`) -- checks whether any alternative can even come close. If none
+   can, the hash move is "singular" and its own child gets the same one-ply extension a checking
+   move already gets from search extensions, since the search is now committing real depth to
+   confirming a move the ordering already trusts rather than assuming that trust is warranted.
+   Implemented via two new `negamax` parameters, `excluded_from`/`excluded_to`: a per-node
+   exclusion, never inherited by any recursive call the excluded search itself makes (its own
+   null-move, IID, and move-loop children all pass `-1, -1`, identical to every ordinary node), so
+   nesting is impossible by construction -- the trigger condition also independently requires
+   `excluded_from < 0`, belt and braces. The two places this needed real care, both handled: an
+   excluded node must never resolve via its own TT entry (written for the *whole* move set, not
+   the one this search is deliberately missing) -- the early-return in `_tt_resolve`'s caller is
+   skipped whenever `excluded_from >= 0`, though `hint_from`/`hint_to` are still read for ordering,
+   since the loop's own exclusion check (`continue` on a from/to match) makes that harmless; and an
+   excluded node must never write one either, since a partial-search result stored under the full
+   position's key would corrupt every future non-excluded probe of it -- skipped by wrapping the
+   entire end-of-function store in the same `excluded_from < 0` guard.
+
+Measured cost: a fixed 8s search on the Tier 1 blunder-position FEN now reaches depth 7 complete
+(89971 nodes, essentially identical to every prior tier's depth-7 count) but only depth 8 partial
+(107648 nodes) rather than Tier 12's depth 8 complete (~95-107K nodes) / depth 9 partial -- a real,
+measured throughput cost from the extra verification searches at qualifying nodes, not a
+measurement artifact. This is the expected, accepted tradeoff the technique is known for in real
+engines: real playing strength from singular extensions comes from tactical accuracy on critical
+lines the verification search actually catches, not from raw nodes/sec, which is exactly why this
+item was scoped, implemented, and tested more carefully than anything else in this list rather
+than skipped for its cost alone.
+
+New dedicated test: `tests/test_singular_extension.py` -- directly exercises the exclusion
+mechanism itself (not the singularity heuristic's tuning, which nothing asserts on): a baseline
+unexcluded search populates its own TT normally; excluding one real, always-legal move (a king
+step) still returns a sane material-edge score by searching everything else; and, most
+importantly, the excluded search never writes to the TT under its own position's key while its own
+real-move children (different positions, reached normally) still write to theirs -- caught a real
+bug in the test itself during development (an earlier draft asserted nothing was written anywhere,
+which is wrong: children legitimately write under their own keys) before the assertion was
+narrowed to the actual invariant that matters.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -540,6 +585,12 @@ clock values.
   constant change, not a search-algorithm one, so the 8s-search throughput check does not apply
   here -- functional games exercising the real `agent.get_move` path, which is the only consumer
   of `timeman.budget_ms`/`extended_budget_ms`, is the relevant check).
+- Tier 13: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks, threats,
+  quiescence-check, king-safety, fifty-move, insufficient-material, timeman) plus the new
+  `tests/test_singular_extension.py` all clean, plus the same functional in-process games (no
+  crashes, no hangs, checkmates both colours -- meaningful here specifically, since a bug in the
+  exclusion/recursion-termination logic could plausibly manifest as a hang rather than a wrong
+  score). 8s-search throughput check shows a real, measured cost -- see the Tier 13 section above.
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -596,6 +647,39 @@ here even if it mattered. Going forward: verify with the correctness gate and fu
 same as every item above; do not re-run local `harness.play`/`harness.arena` init timing as a
 check step.
 
+**Update: real platform numbers arrived and made this concrete, not theoretical.** The website
+reported ~85s init against a real 90s cap -- a 5s margin, not the "dev numbers don't reflect
+organizer hardware" situation the policy above was written for. That prompted the first actual
+stage-by-stage profiling of `_warm_up()`: `search_root`'s first compile is ~85-90% of total init
+time, and it's genuinely `negamax`/`quiescence`/SEE/move-ordering's own control flow, not
+`evaluate.py`'s eval terms (mobility/king-safety/threats/pins-xrays/passed-pawns all compile in
+~8s together). Two fixes were tried and confirmed dead: numba caching still fails on every real
+function here for the reason already established above, and thread-based parallel warm-up is
+blocked by numba's own global compiler lock, which serializes JIT compilation across threads
+within a process.
+
+With those out, the only remaining lever was cutting search-side control-flow complexity --
+singular extensions (the newest, most control-flow-heavy piece, only triggering at depth >= 7)
+was removed via `git revert` of its own isolated commit as a trial, dropping this dev machine's
+`search_root` compile from ~187s to ~80s (total init ~210s to ~98s, 53%). That trial was then
+tested head-to-head against the pre-removal build over 6 real games (`harness.sandbox`'s actual
+subprocess protocol, extended init budget so both sides could start on this dev machine, 15s+150ms
+blitz): singular extensions won 5-1, five of those by outright checkmate, not time scrambles. Six
+games is a small sample, but a 5-1 result with five clean checkmates is a real signal, not noise
+worth dismissing -- singular extensions costs meaningfully more strength than its "only triggers
+deep, highest-risk item on the list" framing suggested when it shipped.
+
+**Decision: restore singular extensions, keep the tighter margin.** The build that reported 85s on
+the real platform was not failing -- it was tight, not broken. Trading a measured, real strength
+loss for margin the current build was not actually short on (5s is uncomfortable but not
+insufficient) was judged the wrong side of this trade. Singular extensions is back in as of this
+decision; the revert-then-restore round trip is `c5be352` (Tier 13 ships) -> `cde9c17` (reverted
+for init time) -> the commit after this one (restored). If init-time margin becomes a live problem
+again (a real failed init on the platform, not just a tight number), the next candidates in the
+same vein -- search-side control flow, not eval terms, per the profiling above -- are IID and the
+counter-move heuristic from Tier 3, not singular extensions again unless a bigger head-to-head
+sample changes this read.
+
 ## Future
 
 See `docs/FUTURE.md` -- items 1-7 (adaptive time management, aspiration windows, null-move
@@ -604,7 +688,7 @@ pruning, SEE, LMR, search extensions, magic bitboards) are the Tier 2 work above
 reasons in the Tier 2 section above, not for lack of time -- see there before picking any of them
 back up.
 
-Tiers 3-12 are further passes beyond FUTURE.md's original list, none of them tracked in that file
+Tiers 3-13 are further passes beyond FUTURE.md's original list, none of them tracked in that file
 -- see each one's own section above for what it covers and why. In short, two rounds of further
 ideas were proposed and fully worked through, one item at a time with the full gate re-run after
 each: the first round (Tier 3) added mobility eval, futility pruning, a bigger two-tier TT, IID,
@@ -613,49 +697,13 @@ still being missed prompted the second round: Tier 4 picked up two previously-no
 ideas (phase-blended passed pawns, king-distance-to-passed-pawn); Tier 5 added tactical-motif eval
 terms (forks, hanging pieces, pawn threats, pins, x-rays/skewers) directly for the report; Tier 6,
 found while working on Tier 5, fixed a real search bug (quiescence never handled being in check
-correctly); a further "what else can be done" discussion produced six more items: Tier 7 (history
-malus), Tier 8 (king safety eval), Tier 9 (reverse-futility/static-null pruning, late move
-pruning), Tier 10 (fifty-move-rule draw detection), Tier 11 (insufficient-material draw
-detection), and Tier 12 (a `timeman.py` move-overhead safety margin).
+correctly); a further "what else can be done" discussion produced six more items, all picked up
+in turn: Tier 7 (history malus), Tier 8 (king safety eval), Tier 9 (reverse-futility/static-null
+pruning, late move pruning), Tier 10 (fifty-move-rule draw detection), Tier 11 (insufficient-
+material draw detection), Tier 12 (a `timeman.py` move-overhead safety margin), and Tier 13
+(singular extensions, the highest-risk item on the list, done last and most carefully).
 
-Singular extensions (excluded-move verification search) was implemented, fully verified, and
-shipped as Tier 13 -- then deliberately reverted (see "Tier 13: implemented, then reverted for
-init time" below) once real platform numbers made init-time margin a live constraint rather than
-a theoretical one. Still not picked up: generating a small custom endgame tablebase locally via
-retrograde analysis instead of downloading one (item 8's blocker) -- multi-day scope, not worth it
-against the time remaining unless everything else is done early.
-
-## Tier 13: implemented, then reverted for init time
-
-Shipped, fully verified (own test file, functional games, full gate), and then removed one commit
-later for a reason specific to it, not a correctness problem: the actual competition platform
-reported an ~85s init time against a 90s cap -- a 5s margin, not the "dev numbers don't match
-organizer hardware, don't worry about it" situation the init-time policy above was written for.
-That prompted an actual profiling pass (not present before this point): instrumenting `_warm_up()`
-stage by stage showed `search_root`'s first compile alone is ~85-90% of total init time, and a
-follow-up split (calling `evaluate.evaluate` before `search_root` to isolate it) showed
-`evaluate.py`'s entire eval-term chain -- material/PST, pawn structure, mobility, passed pawns,
-threats, pins/x-rays, king safety, everything from Tiers 4/5/8 -- compiles in ~8s. The remaining
-~150s+ is `negamax`/`quiescence`/SEE/move-ordering's own control flow, accumulated across Tiers
-2-13. Two other candidate fixes were tried and ruled out first: numba's on-disk caching
-(`cache=True`) fails on every one of these functions with "Cannot cache compiled function ... uses
-dynamic globals" -- confirmed directly against the real codebase, not just theory, since they all
-touch the large global attack/PST/magic tables -- and thread-based parallel warm-up is blocked by
-numba's global compiler lock, which serializes JIT compilation across threads within a process.
-
-With caching and parallelism both dead ends, the only remaining lever was cutting search-side
-control-flow complexity -- a real strength trade, not a free technical win, so it was put to the
-user rather than decided unilaterally. Singular extensions was the clear first candidate: the
-newest and most control-flow-heavy piece of `negamax` (an entire extra recursive verification
-search plus TT-exclusion machinery), the highest-risk item on the list per its own section when it
-shipped, and only triggers at depth >= 7, so its removal costs the least strength per second of
-init time recovered of anything shipped. Reverted via `git revert` of its own isolated commit
-(`c5be352`) -- clean because it was the only commit that touched those lines, so this removed
-exactly what Tier 13 added and nothing else: `SE_MIN_DEPTH`/`SE_TT_DEPTH_MARGIN`/
-`SE_MARGIN_PER_DEPTH`, the `excluded_from`/`excluded_to` parameters threaded through `negamax`,
-the singular-extension verification block itself, and `tests/test_singular_extension.py`.
-Re-verified with the full gate after reverting (see below). If init-time margin is still tight
-after this, the next candidates in the same vein (search-side control flow, not eval terms) would
-be IID and the counter-move heuristic from Tier 3 -- not touched in this pass since singular
-extensions alone was expected to be the largest single contributor and the user had not yet asked
-to go further.
+That closes out every item raised across both rounds. Still not picked up: generating a small
+custom endgame tablebase locally via retrograde analysis instead of downloading one (item 8's
+blocker) -- multi-day scope, not worth it against the time remaining unless everything else is
+done early.
