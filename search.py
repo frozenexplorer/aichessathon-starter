@@ -249,33 +249,6 @@ played -- it exists purely so the search's own evaluation of a hypothetical such
 while descending the tree is accurate rather than running ordinary material/PST/threat scoring on
 a position that is provably a dead draw.
 
-Lazy SMP: search_root is decorated nogil=True (confirmed to actually release the GIL for real
-multi-core execution on this numba version, not just in theory -- verified with a standalone
-synthetic-workload benchmark before touching this decorator) so agent.py can run several concurrent
-calls to it from separate Python threads, all sharing one transposition table, while each thread
-gets its own independent history/opponent_history copy, killer table, history-heuristic table, and
-counter-move table (see agent.py's own docstring for exactly which arrays are shared vs per-thread
-and why). Only search_root needs the decorator, not negamax/quiescence/evaluate/etc: numba resolves
-an njit-to-njit call as a direct native call at the CALLEE's own compile time, not through the
-Python-facing dispatcher wrapper that nogil actually controls, so nogil is only meaningful on the
-one function ever invoked directly from Python -- confirmed with a standalone probe (mutate a
-global read by a leaf function two calls deep, recompile only that leaf and its direct caller,
-observe the change propagate with no need to touch anything above them) before relying on it here.
-_search_restricted (agent.py's tablebase-narrowed endgame path) is deliberately left
-single-threaded for now, calling negamax directly exactly as before -- Lazy SMP is scoped to the
-main search path only for this first pass.
-
-Sharing the TT array across threads without locks is a deliberate, standard "Lazy SMP" tradeoff,
-not an oversight: a torn read (one thread reading a slot mid-write by another) can only ever
-produce the same class of "wrong info" a single-threaded run already has to tolerate from an
-ordinary hash-index collision between two unrelated positions -- a hint move that does not match
-any move in the current position's own generated legal-move list, which move ordering already must
-skip harmlessly rather than trust blindly, collision or not. tt_from/tt_to/tt_promo are single-byte
-(int8) fields, so a torn read of any one of them individually is not even possible on real
-hardware; tt_key is a naturally-aligned 8-byte word, atomic on every mainstream x86-64/ARM64 target
-in practice (not guaranteed by the language spec, universally relied on by real engines that do
-this). Nothing shared here can mask a real repetition or corrupt the claim-eligibility safety net
--- both read from the independent, per-thread history arrays, never the TT.
 """
 
 import math
@@ -285,9 +258,11 @@ import numpy as np
 from numba import njit, objmode
 
 from attacks import KING_ATTACKS, KNIGHT_ATTACKS, PAWN_ATTACKS, bishop_attacks, rook_attacks
-from bitboard import BISHOP, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE
+from bitboard import BISHOP, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE, i64
 from evaluate import PIECE_VALUE, evaluate
 from movegen import (
+    _bit_scan,
+    _i64,
     generate_legal,
     has_non_pawn_material,
     is_check,
@@ -302,9 +277,17 @@ from zobrist import position_hash
 MATE = 1_000_000
 INF = 2_000_000
 CHECK_INTERVAL = 127
-QUIESCENCE_MAX_PLIES = 24
-QSEARCH_CHECK_BUDGET = 6
+QUIESCENCE_MAX_PLIES = i64(24)
+QSEARCH_CHECK_BUDGET = i64(6)
 ONE = np.uint64(1)
+
+# i64() itself is plain, un-jitted Python (see bitboard.py), so it can only be called from
+# ordinary module-level/Python code, never from inside an njit function body -- these two are for
+# the njit-to-njit call sites below that would otherwise pass a bare int literal (claim_eligible_
+# for_opponent's lookahead=1, quick_best_move's pv sentinel -1) and mint a fresh Literal[int]
+# specialisation (see docs/plan.md Phase 1.1(a)).
+_LOOKAHEAD_ONE = i64(1)
+_NO_PV = i64(-1)
 
 # Delta pruning in quiescence: a capture whose SEE, added to the stand-pat eval, still can't
 # reach alpha within this safety margin is skipped -- see quiescence's move loop. A generous
@@ -362,7 +345,7 @@ del _d, _m, _r
 # sequence) would let one line's effective depth grow arbitrarily, at the expense of every
 # sibling line sharing the same time budget. MAX_CHECK_EXTENSIONS is deliberately small: enough
 # for a real forcing sequence, far short of enough to meaningfully skew the time budget.
-MAX_CHECK_EXTENSIONS = 8
+MAX_CHECK_EXTENSIONS = i64(8)
 
 # Futility pruning: at a shallow, non-check node, a quiet move whose best case (the static eval
 # plus a depth-scaled margin) still can't reach alpha is skipped outright rather than searched --
@@ -438,12 +421,13 @@ def _time_up(deadline: float, counters: np.ndarray) -> bool:
 
 @njit(cache=False)
 def is_capture(bb: np.ndarray, meta: np.ndarray, from_sq: int, to_sq: int) -> bool:
-    opponent = 1 - meta[0]
+    color = _i64(meta[0])
+    opponent = 1 - color
     to_bit = ONE << np.uint64(to_sq)
     for pt in range(6):
         if bb[opponent * 6 + pt] & to_bit:
             return True
-    if to_sq == meta[5] and piece_type_at(bb, meta[0], from_sq) == PAWN:
+    if to_sq == meta[5] and piece_type_at(bb, color, from_sq) == PAWN:
         return (from_sq % 8) != (to_sq % 8)
     return False
 
@@ -451,14 +435,6 @@ def is_capture(bb: np.ndarray, meta: np.ndarray, from_sq: int, to_sq: int) -> bo
 # Exchange chains are bounded by total pieces on the board (32), so 32 gain-array slots is
 # ample headroom -- see() never appends past one entry per capture in the chain.
 SEE_MAX_DEPTH = 32
-
-
-@njit(cache=False)
-def _bit_scan(bits: np.uint64) -> int:
-    for square in range(64):
-        if bits & (ONE << np.uint64(square)):
-            return square
-    return -1
 
 
 @njit(cache=False)
@@ -507,7 +483,7 @@ def see(bb: np.ndarray, meta: np.ndarray, from_sq: int, to_sq: int, promo: int) 
     it can misjudge a recapture that is actually illegal because the recapturing piece is pinned),
     which is why this is a move-ordering and quiescence-pruning heuristic, never a legality check.
     """
-    color = meta[0]
+    color = _i64(meta[0])
     opponent = 1 - color
     moving_pt = piece_type_at(bb, color, from_sq)
     ep_square = meta[5]
@@ -574,9 +550,10 @@ def _move_score(
     if promo >= 0:
         score += 500 + PIECE_VALUE[promo]
 
-    opponent = 1 - meta[0]
+    color = _i64(meta[0])
+    opponent = 1 - color
     victim_pt = piece_type_at(bb, opponent, to_sq)
-    is_ep = to_sq == meta[5] and piece_type_at(bb, meta[0], from_sq) == PAWN
+    is_ep = to_sq == meta[5] and piece_type_at(bb, color, from_sq) == PAWN
     if victim_pt >= 0 or (is_ep and (from_sq % 8) != (to_sq % 8)):
         score += 10_000 + see(bb, meta, from_sq, to_sq, promo)
     return score
@@ -597,7 +574,8 @@ def _score_moves(
     scores = np.empty(count, dtype=np.int64)
     for i in range(count):
         scores[i] = _move_score(
-            bb, meta, from_arr[i], to_arr[i], promo_arr[i], pv_from, pv_to, pv_promo
+            bb, meta, _i64(from_arr[i]), _i64(to_arr[i]), _i64(promo_arr[i]),
+            pv_from, pv_to, pv_promo,
         )
     return scores
 
@@ -636,7 +614,9 @@ def _score_moves2(
     """
     scores = np.empty(count, dtype=np.int64)
     for i in range(count):
-        from_sq, to_sq, promo = from_arr[i], to_arr[i], promo_arr[i]
+        from_sq = _i64(from_arr[i])
+        to_sq = _i64(to_arr[i])
+        promo = _i64(promo_arr[i])
         base = _move_score(bb, meta, from_sq, to_sq, promo, pv_from, pv_to, pv_promo)
         if base != 0:
             scores[i] = base
@@ -676,7 +656,9 @@ def quiescence(
 
     if check_budget > 0 and is_check(bb, meta):
         for i in range(count):
-            f, t, p = from_arr[i], to_arr[i], promo_arr[i]
+            f = _i64(from_arr[i])
+            t = _i64(to_arr[i])
+            p = _i64(promo_arr[i])
             new_bb, new_meta = make_move(bb, meta, f, t, p)
             score = -quiescence(
                 new_bb, new_meta, -beta, -alpha, deadline, counters, qdepth, check_budget - 1
@@ -700,7 +682,9 @@ def quiescence(
     scores = np.full(count, -INF, dtype=np.int64)
     ncap = 0
     for i in range(count):
-        f, t, p = from_arr[i], to_arr[i], promo_arr[i]
+        f = _i64(from_arr[i])
+        t = _i64(to_arr[i])
+        p = _i64(promo_arr[i])
         if is_capture(bb, meta, f, t) or p == QUEEN:
             scores[i] = see(bb, meta, f, t, p)
             ncap += 1
@@ -719,7 +703,9 @@ def quiescence(
             # margin, catching the case SEE-pruning alone misses (a real but too-small gain
             # against a large existing deficit).
             break
-        f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
+        f = _i64(from_arr[idx])
+        t = _i64(to_arr[idx])
+        p = _i64(promo_arr[idx])
         new_bb, new_meta = make_move(bb, meta, f, t, p)
         score = -quiescence(
             new_bb, new_meta, -beta, -alpha, deadline, counters, qdepth - 1, check_budget
@@ -838,7 +824,7 @@ def negamax(
             tt_promo[slot_a]
         )
         hint_tt_depth, hint_tt_score, hint_tt_flag = (
-            int(tt_depth[slot_a]), int(tt_score[slot_a]), int(tt_flag[slot_a]),
+            int(tt_depth[slot_a]) - 1, int(tt_score[slot_a]), int(tt_flag[slot_a]),
         )
         if excluded_from < 0:
             hit, s, alpha, beta = _tt_resolve(
@@ -851,7 +837,7 @@ def negamax(
             tt_promo[slot_b]
         )
         hint_tt_depth, hint_tt_score, hint_tt_flag = (
-            int(tt_depth[slot_b]), int(tt_score[slot_b]), int(tt_flag[slot_b]),
+            int(tt_depth[slot_b]) - 1, int(tt_score[slot_b]), int(tt_flag[slot_b]),
         )
         if excluded_from < 0:
             hit, s, alpha, beta = _tt_resolve(
@@ -902,7 +888,7 @@ def negamax(
         and depth >= NULL_MOVE_MIN_DEPTH
         and -MATE_STORE_THRESHOLD < beta < MATE_STORE_THRESHOLD
         and not in_check
-        and has_non_pawn_material(bb, meta[0])
+        and has_non_pawn_material(bb, _i64(meta[0]))
     ):
         null_meta = make_null_move(meta)
         null_score = -negamax(
@@ -937,14 +923,14 @@ def negamax(
                 tt_promo[slot_a]
             )
             hint_tt_depth, hint_tt_score, hint_tt_flag = (
-                int(tt_depth[slot_a]), int(tt_score[slot_a]), int(tt_flag[slot_a]),
+                int(tt_depth[slot_a]) - 1, int(tt_score[slot_a]), int(tt_flag[slot_a]),
             )
         elif tt_key[slot_b] == h:
             hint_from, hint_to, hint_promo = int(tt_from[slot_b]), int(tt_to[slot_b]), int(
                 tt_promo[slot_b]
             )
             hint_tt_depth, hint_tt_score, hint_tt_flag = (
-                int(tt_depth[slot_b]), int(tt_score[slot_b]), int(tt_flag[slot_b]),
+                int(tt_depth[slot_b]) - 1, int(tt_score[slot_b]), int(tt_flag[slot_b]),
             )
 
     singular_extension = False
@@ -1007,11 +993,13 @@ def negamax(
     best_idx = -1
     for oi in range(count):
         idx = order[oi]
-        f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
+        f = _i64(from_arr[idx])
+        t = _i64(to_arr[idx])
+        p = _i64(promo_arr[idx])
         if excluded_from >= 0 and f == excluded_from and t == excluded_to:
             continue
         is_cap = is_capture(bb, meta, f, t)
-        moved_pawn = piece_type_at(bb, meta[0], f) == PAWN
+        moved_pawn = piece_type_at(bb, _i64(meta[0]), f) == PAWN
         child_halfmove_clock = 0 if (is_cap or moved_pawn) else halfmove_clock + 1
         new_bb, new_meta = make_move(bb, meta, f, t, p)
         gives_check = is_check(new_bb, new_meta)
@@ -1123,26 +1111,29 @@ def negamax(
                 # tier exists for.
                 for oi2 in range(oi):
                     idx2 = order[oi2]
-                    f2, t2, p2 = from_arr[idx2], to_arr[idx2], promo_arr[idx2]
+                    f2 = _i64(from_arr[idx2])
+                    t2 = _i64(to_arr[idx2])
+                    p2 = _i64(promo_arr[idx2])
                     if p2 < 0 and not is_capture(bb, meta, f2, t2):
                         history_table[f2 * 64 + t2] -= bonus
             break
 
     # Two-tier replacement: prefer the depth-preferred slot on a same-key refresh, an empty slot
-    # (depth == -1, the new_tt() sentinel), or a search that went at least as deep as what is
-    # already there; otherwise fall back to the always-replace slot so this node's result is
-    # still cached even though it didn't earn the depth-preferred one. Skipped entirely for an
-    # excluded-move search: that result reflects only the moves other than excluded_from/to, not
-    # this position's real value, so storing it under the position's real key would corrupt every
-    # future non-excluded probe of it.
+    # (tt_depth == 0, the new_tt() sentinel now that a real entry stores depth + 1 -- see
+    # docs/plan.md Phase 1.8), or a search that went at least as deep as what is already there;
+    # otherwise fall back to the always-replace slot so this node's result is still cached even
+    # though it didn't earn the depth-preferred one. Skipped entirely for an excluded-move search:
+    # that result reflects only the moves other than excluded_from/to, not this position's real
+    # value, so storing it under the position's real key would corrupt every future non-excluded
+    # probe of it.
     if excluded_from < 0:
-        if tt_key[slot_a] == h or tt_depth[slot_a] < 0 or depth >= tt_depth[slot_a]:
+        if tt_key[slot_a] == h or tt_depth[slot_a] == 0 or depth + 1 >= tt_depth[slot_a]:
             write_idx = slot_a
         else:
             write_idx = slot_b
 
         tt_key[write_idx] = h
-        tt_depth[write_idx] = depth
+        tt_depth[write_idx] = depth + 1
         if best >= MATE_STORE_THRESHOLD:
             tt_score[write_idx] = best + ply
         elif best <= -MATE_STORE_THRESHOLD:
@@ -1214,7 +1205,9 @@ def claim_eligible_for_opponent(
 
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     for i in range(count):
-        new_bb, new_meta = make_move(bb, meta, from_arr[i], to_arr[i], promo_arr[i])
+        new_bb, new_meta = make_move(
+            bb, meta, _i64(from_arr[i]), _i64(to_arr[i]), _i64(promo_arr[i])
+        )
         reply_hash = position_hash(new_bb, new_meta)
         reply_matches = 0
         for j in range(hist_len):
@@ -1239,9 +1232,6 @@ def _search_root_pass(
     beta: int,
     deadline: float,
     counters: np.ndarray,
-    pv_from: int,
-    pv_to: int,
-    pv_promo: int,
     history: np.ndarray,
     hist_len: int,
     opponent_history: np.ndarray,
@@ -1272,13 +1262,17 @@ def _search_root_pass(
     wider window on a fail-high/fail-low without re-ordering or re-generating moves.
     """
     best_score = -INF
-    best_from, best_to, best_promo = from_arr[order[0]], to_arr[order[0]], promo_arr[order[0]]
+    best_from = _i64(from_arr[order[0]])
+    best_to = _i64(to_arr[order[0]])
+    best_promo = _i64(promo_arr[order[0]])
 
     for oi in range(count):
         idx = order[oi]
-        f, t, p = from_arr[idx], to_arr[idx], promo_arr[idx]
+        f = _i64(from_arr[idx])
+        t = _i64(to_arr[idx])
+        p = _i64(promo_arr[idx])
         child_halfmove_clock = (
-            0 if (is_capture(bb, meta, f, t) or piece_type_at(bb, meta[0], f) == PAWN)
+            0 if (is_capture(bb, meta, f, t) or piece_type_at(bb, _i64(meta[0]), f) == PAWN)
             else halfmove_clock + 1
         )
         new_bb, new_meta = make_move(bb, meta, f, t, p)
@@ -1308,7 +1302,8 @@ def _search_root_pass(
         if counters[1]:
             return best_from, best_to, best_promo, best_score, False
         if claim_eligible_for_opponent(
-            new_bb, new_meta, history, hist_len, opponent_history, opponent_hist_len, 1
+            new_bb, new_meta, history, hist_len, opponent_history, opponent_hist_len,
+            _LOOKAHEAD_ONE,
         ):
             score = min(score, 0)
         if score > best_score:
@@ -1320,7 +1315,7 @@ def _search_root_pass(
     return best_from, best_to, best_promo, best_score, True
 
 
-@njit(cache=False, nogil=True)
+@njit(cache=False)
 def search_root(
     bb: np.ndarray,
     meta: np.ndarray,
@@ -1377,7 +1372,7 @@ def search_root(
 
     while True:
         best_from, best_to, best_promo, best_score, completed = _search_root_pass(
-            bb, meta, depth, alpha, beta, deadline, counters, pv_from, pv_to, pv_promo,
+            bb, meta, depth, alpha, beta, deadline, counters,
             history, hist_len, opponent_history, opponent_hist_len,
             tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
             killer_from, killer_to, killer_promo, history_table,
@@ -1404,7 +1399,10 @@ def quick_best_move(
     """The best-looking legal move by MVV-LVA/promotion score alone, no search. Never recurses,
     so it has no way to overrun a deadline -- the fallback for when there is no time to search.
     """
-    scores = _score_moves(bb, meta, from_arr, to_arr, promo_arr, count, -1, -1, -1)
+    scores = _score_moves(
+        bb, meta, from_arr, to_arr, promo_arr, count,
+        _NO_PV, _NO_PV, _NO_PV,
+    )
     best_idx = 0
     best_score = scores[0]
     for i in range(1, count):
@@ -1422,17 +1420,20 @@ def new_tt() -> tuple[
     np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
 ]:
     """A fresh, empty transposition table -- parallel arrays, two raw slots per bucket (see this
-    module's docstring). depth=-1 marks an empty slot implicitly (any real search depth is >= 0,
-    so a real entry always compares >= any depth request the first time it is written; key is
-    separately checked for a match anyway).
+    module's docstring). Stored depth is the real search depth plus one, so 0 (not -1) marks an
+    empty slot: a real entry's stored depth is always >= 1 (negamax only ever reaches the store
+    site with depth >= 1, the depth <= 0 case having already returned via quiescence), which lets
+    every array here be zero-initialised (a lazy calloc) instead of eagerly written by np.full --
+    ~117 MB less RSS at TT_BUCKETS' current size, no behaviour change (key is separately checked
+    for a match anyway, and every stored-depth read subtracts 1 back off -- see negamax).
     """
     key = np.zeros(TT_SIZE, dtype=np.uint64)
-    depth = np.full(TT_SIZE, -1, dtype=np.int32)
+    depth = np.zeros(TT_SIZE, dtype=np.int32)
     score = np.zeros(TT_SIZE, dtype=np.int32)
     flag = np.zeros(TT_SIZE, dtype=np.int8)
-    move_from = np.full(TT_SIZE, -1, dtype=np.int8)
-    move_to = np.full(TT_SIZE, -1, dtype=np.int8)
-    move_promo = np.full(TT_SIZE, -1, dtype=np.int8)
+    move_from = np.zeros(TT_SIZE, dtype=np.int8)
+    move_to = np.zeros(TT_SIZE, dtype=np.int8)
+    move_promo = np.zeros(TT_SIZE, dtype=np.int8)
     return key, depth, score, flag, move_from, move_to, move_promo
 
 
