@@ -7,13 +7,23 @@ ray from it, excluding the board edge in each direction -- what happens past the
 depends on what's on the edge square itself), indexed by ((occupied & mask) * magic) >> shift.
 The magic numbers themselves are precomputed offline (find_magics-style random search, verified
 against a plain ray-cast reference for every occupancy subset of the relevant mask) and hardcoded
-below -- nothing at runtime searches for a magic; import time only rebuilds each square's lookup
-table from these fixed numbers, one entry per subset via the same ray-cast reference (kept below,
-under a leading underscore, purely for that table-building and for the differential test in
-tests/test_magic_attacks.py that checks magic lookups agree with it over random occupancies).
+below -- nothing at runtime searches for a magic.
+
+ROOK_ATTACK_TABLE / BISHOP_ATTACK_TABLE ship precomputed in weights/attacks.npz (~2.3 MB) rather
+than being rebuilt at import: building them from scratch means one ray-cast per occupancy subset
+per square (107,648 calls total across both tables), and doing that through njit-compiled
+_rook_ray_attacks / _bishop_ray_attacks cost two extra compiles for no runtime benefit (the
+build loop itself only ever runs once, at import, never in the search hot path -- see
+docs/plan.md Phase 1.5). _rook_ray_attacks / _bishop_ray_attacks are therefore plain, un-jitted
+Python here: they exist only for _build_magic_table (used to regenerate weights/attacks.npz when
+the magic numbers below ever change) and as the differential-test oracle in
+tests/test_magic_attacks.py, neither of which is on the init-time or search-time path.
+_CHECKSUM guards against a corrupt or stale weights/attacks.npz failing loudly at import instead
+of silently producing wrong attacks.
 """
 
 from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 from numba import njit
@@ -74,7 +84,6 @@ KING_ATTACKS = _build_king_attacks()
 PAWN_ATTACKS = _build_pawn_attacks()
 
 
-@njit(cache=False)
 def _rook_ray_attacks(square: int, occupied: np.uint64) -> np.uint64:
     file, rank = square % 8, square // 8
     bits = np.uint64(0)
@@ -90,7 +99,6 @@ def _rook_ray_attacks(square: int, occupied: np.uint64) -> np.uint64:
     return bits
 
 
-@njit(cache=False)
 def _bishop_ray_attacks(square: int, occupied: np.uint64) -> np.uint64:
     file, rank = square % 8, square // 8
     bits = np.uint64(0)
@@ -234,12 +242,40 @@ def _build_magic_table(
     return table
 
 
-ROOK_ATTACK_TABLE = _build_magic_table(
-    _ROOK_MASKS_RAW, _ROOK_MAGICS_RAW, _ROOK_BITS, _rook_ray_attacks, 1 << MAX_ROOK_BITS
-)
-BISHOP_ATTACK_TABLE = _build_magic_table(
-    _BISHOP_MASKS_RAW, _BISHOP_MAGICS_RAW, _BISHOP_BITS, _bishop_ray_attacks, 1 << MAX_BISHOP_BITS
-)
+def _checksum(rook: np.ndarray, bishop: np.ndarray) -> int:
+    """Order-independent sanity check over both tables -- a load-time corruption/staleness guard,
+    not a cryptographic one. XOR-reduce rather than sum so it doesn't rely on uint64 wraparound
+    behaving any particular way.
+    """
+    return int(np.bitwise_xor.reduce(rook.ravel()) ^ np.bitwise_xor.reduce(bishop.ravel()))
+
+
+# Hardcoded once, when weights/attacks.npz was generated from the magic numbers above (see
+# _build_magic_table) -- regenerate both together if _ROOK_MAGICS_RAW/_BISHOP_MAGICS_RAW (or the
+# masks/bits) ever change; a stale pair fails the assert below instead of silently shipping wrong
+# attack data.
+_EXPECTED_CHECKSUM = 4792111478498951490
+
+_WEIGHTS_PATH = Path(__file__).resolve().parent / "weights" / "attacks.npz"
+
+if _WEIGHTS_PATH.exists():
+    with np.load(_WEIGHTS_PATH) as _npz:
+        ROOK_ATTACK_TABLE = _npz["rook"]
+        BISHOP_ATTACK_TABLE = _npz["bishop"]
+    assert _checksum(ROOK_ATTACK_TABLE, BISHOP_ATTACK_TABLE) == _EXPECTED_CHECKSUM, (
+        f"weights/attacks.npz is corrupt or stale (checksum mismatch) -- regenerate it from "
+        f"the magic numbers in {__file__} via _build_magic_table"
+    )
+else:
+    # Dev-time / regeneration fallback only -- the shipped zip always includes weights/attacks.npz
+    # (see docs/plan.md Phase 1.5), so this path is not expected to run on the real platform.
+    ROOK_ATTACK_TABLE = _build_magic_table(
+        _ROOK_MASKS_RAW, _ROOK_MAGICS_RAW, _ROOK_BITS, _rook_ray_attacks, 1 << MAX_ROOK_BITS
+    )
+    BISHOP_ATTACK_TABLE = _build_magic_table(
+        _BISHOP_MASKS_RAW, _BISHOP_MAGICS_RAW, _BISHOP_BITS, _bishop_ray_attacks,
+        1 << MAX_BISHOP_BITS,
+    )
 
 
 @njit(cache=False)
