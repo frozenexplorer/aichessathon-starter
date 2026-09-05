@@ -75,10 +75,12 @@ MAX_DEPTH = 64
 # docstring: "a root search that aborts before finishing is discarded... never returned as a
 # partial, possibly-misordered result"), so starting a depth almost certain to abort wastes that
 # time for nothing -- better to stop one depth early and bank the time for a future move. 4x is a
-# deliberately conservative multiple (real effective branching factor with TT/killers/history
-# ordering is usually well under this), so this only ever skips a depth that is very unlikely to
-# have completed anyway, not one with a real chance.
-BRANCHING_ESTIMATE = 4
+# Phase 2.7 of docs/plan.md: the real effective branching factor with this move ordering (TT,
+# killers, history, counter-move) is 2-3, so 4 almost never actually fires the early stop -- lowered
+# to 2.5 to reclaim some of that margin. Still conservative: a depth needs to look >2.5x as
+# expensive as the last one to get skipped, so this only ever skips a depth genuinely unlikely to
+# complete, not one with a real chance.
+BRANCHING_ESTIMATE = 2.5
 
 _history = np.zeros(sr.HISTORY_CAPACITY, dtype=np.uint64)
 _history_len = 0

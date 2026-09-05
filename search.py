@@ -267,6 +267,7 @@ from movegen import (
     has_non_pawn_material,
     is_check,
     is_insufficient_material,
+    king_square,
     make_move,
     make_null_move,
     occ_all,
@@ -277,6 +278,14 @@ from zobrist import position_hash
 MATE = 1_000_000
 INF = 2_000_000
 CHECK_INTERVAL = 127
+# Phase 2.7 of docs/plan.md: a non-capturing promotion used to score 500 + PIECE_VALUE[promo]
+# (<=1400 for a queen), which sits BELOW killers (5001/5002), the counter-move slot (5000), and any
+# quiet move with history >= 1400 -- and _score_moves2's "base != 0 skips killer/history" short
+# circuit meant a promotion could never claw its way back up from there either. Raised above the
+# killer/counter-move/history band (all capped at 4999-5002) and kept below the capture floor
+# (10_000 + the worst plausible SEE loss) so "promotes, does not also capture" now sorts where it
+# belongs: after captures, before quiet moves.
+PROMOTION_BASE = 9_000
 QUIESCENCE_MAX_PLIES = i64(24)
 QSEARCH_CHECK_BUDGET = i64(6)
 ONE = np.uint64(1)
@@ -295,11 +304,14 @@ _NO_PV = i64(-1)
 DELTA_MARGIN = 200
 
 # Aspiration windows: search_root centers the first pass's alpha-beta window on the previous
-# iterative-deepening depth's score instead of always searching -INF..INF, re-searching with the
-# full window on a fail-high/fail-low. NO_PREV_SCORE (a value no real score or mate score can ever
+# iterative-deepening depth's score instead of always searching -INF..INF. Phase 2.7 of
+# docs/plan.md: a fail-high/fail-low used to jump straight from a +-50 window to the full
+# -INF..INF, throwing away a whole re-search's worth of the previous pass's work every time the
+# score moved by even a little more than 50 -- widen through +-200 first and only fall back to
+# the full window if that also fails. NO_PREV_SCORE (a value no real score or mate score can ever
 # equal, since MATE < INF strictly) tells search_root there is no previous depth to center on --
 # used for depth 1 and whenever the prior score was itself outside the mate threshold.
-ASPIRATION_WINDOW = 50
+ASPIRATION_WINDOWS = np.array([50, 200], dtype=np.int64)
 NO_PREV_SCORE = INF
 
 # Null-move pruning: give the side to move a free pass and search the rest at a reduced depth; if
@@ -432,6 +444,46 @@ def is_capture(bb: np.ndarray, meta: np.ndarray, from_sq: int, to_sq: int) -> bo
     return False
 
 
+@njit(cache=False)
+def _gives_check_direct(
+    bb: np.ndarray, meta: np.ndarray, from_sq: int, to_sq: int, promo: int, moving_pt: int
+) -> bool:
+    """Cheap, DIRECT-check-only approximation of "does playing (from_sq, to_sq, promo) give
+    check?", without calling make_move + is_check (a full board copy). Computes only the moved
+    piece's own attack pattern from `to_sq` against the enemy king, using the post-move occupancy
+    updated as a single scalar rather than a new board -- misses discovered checks (moving a piece
+    off a line that unveils an attack from a different piece), which a full is_check would catch.
+
+    Phase 2.6 of docs/plan.md: negamax uses this ONLY to gate the futility/LMP prune checks, so a
+    pruned move never pays for a board copy at all; every move that survives pruning still gets the
+    real, accurate `is_check(new_bb, new_meta)` off its real `make_move` result (needed anyway for
+    the recursive search and for check-extension eligibility, which -- unlike pruning -- must not
+    silently miss discovered checks).
+    """
+    color = _i64(meta[0])
+    opponent = 1 - color
+    king_sq = king_square(bb, opponent)
+    if king_sq < 0:
+        return False
+    king_bit = ONE << np.uint64(king_sq)
+
+    occ_after = occ_all(bb) & ~(ONE << np.uint64(from_sq))
+    occ_after |= ONE << np.uint64(to_sq)
+
+    on_square_pt = promo if (moving_pt == PAWN and promo >= 0) else moving_pt
+    if on_square_pt == PAWN:
+        return bool(PAWN_ATTACKS[color, to_sq] & king_bit)
+    if on_square_pt == KNIGHT:
+        return bool(KNIGHT_ATTACKS[to_sq] & king_bit)
+    if on_square_pt == BISHOP:
+        return bool(bishop_attacks(to_sq, occ_after) & king_bit)
+    if on_square_pt == ROOK:
+        return bool(rook_attacks(to_sq, occ_after) & king_bit)
+    if on_square_pt == QUEEN:
+        return bool((bishop_attacks(to_sq, occ_after) | rook_attacks(to_sq, occ_after)) & king_bit)
+    return False
+
+
 # Exchange chains are bounded by total pieces on the board (32), so 32 gain-array slots is
 # ample headroom -- see() never appends past one entry per capture in the chain.
 SEE_MAX_DEPTH = 32
@@ -442,28 +494,33 @@ def _see_least_valuable_attacker(
     bb: np.ndarray, occ: np.uint64, color: int, square: int
 ) -> tuple[int, int]:
     """The lowest-value piece of `color` attacking `square` given `occ`, as (from_square,
-    piece_type), or (-1, -1) if none. Sliding attacks are recomputed against the live `occ` on
-    every call rather than tracked incrementally, which is what makes discovered ("x-ray")
-    attackers fall out for free as pieces are removed during the exchange in see() below -- once
-    a blocker is cleared from `occ`, bishop_attacks/rook_attacks simply see past it on the next
-    call. Same ray-cast-over-magic-bitboards tradeoff as the rest of attacks.py.
+    piece_type), or (-1, -1) if none. `bb` is the ORIGINAL, unmutated board -- see() below tracks
+    the exchange purely via `occ` (one uint64, bits cleared as pieces are used), so every type
+    lookup here must intersect the original per-type bitboard with `occ` to exclude pieces already
+    spent earlier in the chain. Sliding attacks are recomputed against the live `occ` on every call,
+    which is what makes discovered ("x-ray") attackers fall out for free as pieces are removed
+    during the exchange -- once a blocker is cleared from `occ`, bishop_attacks/rook_attacks simply
+    see past it on the next call. Same ray-cast-over-magic-bitboards tradeoff as the rest of
+    attacks.py.
     """
-    attackers = PAWN_ATTACKS[1 - color, square] & bb[color * 6 + PAWN]
+    attackers = PAWN_ATTACKS[1 - color, square] & bb[color * 6 + PAWN] & occ
     if attackers:
         return _bit_scan(attackers), PAWN
-    attackers = KNIGHT_ATTACKS[square] & bb[color * 6 + KNIGHT]
+    attackers = KNIGHT_ATTACKS[square] & bb[color * 6 + KNIGHT] & occ
     if attackers:
         return _bit_scan(attackers), KNIGHT
-    attackers = bishop_attacks(square, occ) & bb[color * 6 + BISHOP]
+    attackers = bishop_attacks(square, occ) & bb[color * 6 + BISHOP] & occ
     if attackers:
         return _bit_scan(attackers), BISHOP
-    attackers = rook_attacks(square, occ) & bb[color * 6 + ROOK]
+    attackers = rook_attacks(square, occ) & bb[color * 6 + ROOK] & occ
     if attackers:
         return _bit_scan(attackers), ROOK
-    attackers = (bishop_attacks(square, occ) | rook_attacks(square, occ)) & bb[color * 6 + QUEEN]
+    attackers = (
+        (bishop_attacks(square, occ) | rook_attacks(square, occ)) & bb[color * 6 + QUEEN] & occ
+    )
     if attackers:
         return _bit_scan(attackers), QUEEN
-    attackers = KING_ATTACKS[square] & bb[color * 6 + KING]
+    attackers = KING_ATTACKS[square] & bb[color * 6 + KING] & occ
     if attackers:
         return _bit_scan(attackers), KING
     return -1, -1
@@ -482,6 +539,10 @@ def see(bb: np.ndarray, meta: np.ndarray, from_sq: int, to_sq: int, promo: int) 
     Ignores pins and check-legality of intermediate recaptures (a standard SEE simplification --
     it can misjudge a recapture that is actually illegal because the recapturing piece is pinned),
     which is why this is a move-ordering and quiescence-pruning heuristic, never a legality check.
+
+    Phase 2.4 of docs/plan.md: tracks the exchange with a single `occ` bitboard mutated in place
+    (bits cleared as pieces are spent) instead of a full `bb.copy()` per call -- `bb` itself is
+    never written to, only read through `occ`'s mask in `_see_least_valuable_attacker` above.
     """
     color = _i64(meta[0])
     opponent = 1 - color
@@ -495,34 +556,32 @@ def see(bb: np.ndarray, meta: np.ndarray, from_sq: int, to_sq: int, promo: int) 
     if promo >= 0:
         gain[0] += PIECE_VALUE[promo] - PIECE_VALUE[PAWN]
 
-    work = bb.copy()
+    occ = occ_all(bb)
+    occ &= ~(ONE << np.uint64(from_sq))
     if is_ep:
         captured_sq = to_sq - 8 if color == WHITE else to_sq + 8
-        work[opponent * 6 + PAWN] &= ~(ONE << np.uint64(captured_sq))
-    elif victim_pt >= 0:
-        work[opponent * 6 + victim_pt] &= ~(ONE << np.uint64(to_sq))
-    work[color * 6 + moving_pt] &= ~(ONE << np.uint64(from_sq))
+        occ &= ~(ONE << np.uint64(captured_sq))
+    # The mover always ends up on to_sq -- for en passant, to_sq itself was empty beforehand, so
+    # this bit needs setting explicitly rather than relying on the victim having occupied it.
+    occ |= ONE << np.uint64(to_sq)
+
     on_square_pt = promo if (moving_pt == PAWN and promo >= 0) else moving_pt
-    work[color * 6 + on_square_pt] |= ONE << np.uint64(to_sq)
     on_square_value = PIECE_VALUE[on_square_pt]
 
     side = opponent
     depth = 0
     while depth < SEE_MAX_DEPTH - 1:
-        occ = occ_all(work)
-        atk_sq, atk_pt = _see_least_valuable_attacker(work, occ, side, to_sq)
+        atk_sq, atk_pt = _see_least_valuable_attacker(bb, occ, side, to_sq)
         if atk_sq < 0:
             break
         depth += 1
         gain[depth] = on_square_value - gain[depth - 1]
 
-        work[(1 - side) * 6 + on_square_pt] &= ~(ONE << np.uint64(to_sq))
-        work[side * 6 + atk_pt] &= ~(ONE << np.uint64(atk_sq))
+        occ &= ~(ONE << np.uint64(atk_sq))
         promotes = atk_pt == PAWN and (
             (side == WHITE and to_sq >= 56) or (side != WHITE and to_sq <= 7)
         )
         on_square_pt = QUEEN if promotes else atk_pt
-        work[side * 6 + on_square_pt] |= ONE << np.uint64(to_sq)
         on_square_value = PIECE_VALUE[on_square_pt]
         side = 1 - side
 
@@ -548,7 +607,7 @@ def _move_score(
 
     score = 0
     if promo >= 0:
-        score += 500 + PIECE_VALUE[promo]
+        score += PROMOTION_BASE + PIECE_VALUE[promo]
 
     color = _i64(meta[0])
     opponent = 1 - color
@@ -632,6 +691,29 @@ def _score_moves2(
     return scores
 
 
+# Phase 2.5 of docs/plan.md: sentinel a picked move's score is overwritten with so _argmax never
+# selects it again. Below every real move-ordering score (the highest is the PV/hash move's flat
+# 1_000_000, still well under INF) and below quiescence's own -INF "not a capture" sentinel, so it
+# can never be mistaken for either.
+_SELECTED = -INF - 1
+
+
+@njit(cache=False)
+def _argmax(scores: np.ndarray, count: int) -> int:
+    """Index of the highest-scoring not-yet-picked move. Called once per move actually examined
+    (negamax's and quiescence's move loops both break out on a cutoff/prune well before visiting
+    every move), replacing a single `np.argsort(-scores)` that always fully sorts the whole list up
+    front -- most nodes fail high on the first few moves and never need the rest ordered at all.
+    """
+    idx = 0
+    best = scores[0]
+    for i in range(1, count):
+        if scores[i] > best:
+            best = scores[i]
+            idx = i
+    return idx
+
+
 @njit(cache=False)
 def quiescence(
     bb: np.ndarray,
@@ -691,13 +773,14 @@ def quiescence(
     if ncap == 0:
         return alpha
 
-    order = np.argsort(-scores)
-    for oi in range(ncap):
-        idx = order[oi]
-        if scores[idx] < 0 or stand_pat + scores[idx] + DELTA_MARGIN <= alpha:
+    for _ in range(ncap):
+        idx = _argmax(scores, count)
+        see_score = scores[idx]
+        scores[idx] = _SELECTED
+        if see_score < 0 or stand_pat + see_score + DELTA_MARGIN <= alpha:
             # SEE-descending order: everything from here on scores at least as low, so once
             # either condition trips it holds for the rest of the loop too. The first
-            # (scores[idx] < 0) is SEE-pruning -- a capture that loses material outright cannot
+            # (see_score < 0) is SEE-pruning -- a capture that loses material outright cannot
             # help (see docs/FUTURE.md item 4). The second is delta pruning: even a *winning*
             # capture skipped here still can't close the gap to alpha by more than a safety
             # margin, catching the case SEE-pruning alone misses (a real but too-small gain
@@ -987,30 +1070,45 @@ def negamax(
         cm_from, cm_to, cm_promo,
         history_table,
     )
-    order = np.argsort(-scores)
-
     best = -INF
     best_idx = -1
+    # Phase 2.5 of docs/plan.md: pick the next-best remaining move one at a time (_argmax over the
+    # not-yet-picked scores) instead of a single np.argsort(-scores) up front -- most nodes fail
+    # high on the first few moves and never need the rest ordered. picked_idx/move_is_cap record
+    # what _argmax picked (and whether it was a capture) at each position, since the history-malus
+    # backward pass below needs to revisit earlier positions and there is no materialised order
+    # array to read them back from anymore.
+    picked_idx = np.empty(count, dtype=np.int64)
+    move_is_cap = np.empty(count, dtype=np.bool_)
     for oi in range(count):
-        idx = order[oi]
+        idx = _argmax(scores, count)
+        scores[idx] = _SELECTED
+        picked_idx[oi] = idx
         f = _i64(from_arr[idx])
         t = _i64(to_arr[idx])
         p = _i64(promo_arr[idx])
+        # is_capture is a pure function of (bb, meta, f, t) -- computed unconditionally (even for
+        # an excluded move, below) so move_is_cap[oi] is always valid for the malus loop to read
+        # back later, rather than recomputing it there a second (Phase 2.7 of docs/plan.md: this
+        # used to run three times per cutoff move -- here, at the cutoff check, and in the malus
+        # loop -- now once).
+        is_cap = is_capture(bb, meta, f, t)
+        move_is_cap[oi] = is_cap
         if excluded_from >= 0 and f == excluded_from and t == excluded_to:
             continue
-        is_cap = is_capture(bb, meta, f, t)
-        moved_pawn = piece_type_at(bb, _i64(meta[0]), f) == PAWN
+        moving_pt = piece_type_at(bb, _i64(meta[0]), f)
+        moved_pawn = moving_pt == PAWN
         child_halfmove_clock = 0 if (is_cap or moved_pawn) else halfmove_clock + 1
-        new_bb, new_meta = make_move(bb, meta, f, t, p)
-        gives_check = is_check(new_bb, new_meta)
-        if ext_budget > 0 and gives_check:
-            child_depth = depth
-            child_ext_budget = ext_budget - 1
-        else:
-            child_depth = depth - 1
-            child_ext_budget = ext_budget
 
         if oi == 0:
+            new_bb, new_meta = make_move(bb, meta, f, t, p)
+            gives_check = is_check(new_bb, new_meta)
+            if ext_budget > 0 and gives_check:
+                child_depth = depth
+                child_ext_budget = ext_budget - 1
+            else:
+                child_depth = depth - 1
+                child_ext_budget = ext_budget
             if singular_extension and child_depth == depth - 1 and f == hint_from and t == hint_to:
                 child_depth = depth
             score = -negamax(
@@ -1021,27 +1119,41 @@ def negamax(
                 counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
             )
         else:
-            if futile and p < 0 and not gives_check and not is_cap:
-                # A quiet move at a shallow, non-check node when even the best case (static eval
-                # plus a depth-scaled margin) can't reach alpha -- skip it outright rather than
-                # spend a search on it. oi == 0 (the hash/best-ordered move) is never skipped, so
-                # this node always has at least one fully-searched move to report a score from.
-                continue
+            # Phase 2.6 of docs/plan.md: futility and LMP both used to run only after make_move (a
+            # full board copy) + is_check had already been paid for on every single move, purely to
+            # learn gives_check for a check that then often just skips the move anyway. Try the
+            # cheap, direct-check-only _gives_check_direct first (only meaningful when both prunes'
+            # other guards already hold); if it says the move survives, or isn't even a candidate
+            # for either prune, fall through to the real make_move + is_check below exactly as
+            # before -- this only ever changes the cost of a move that ends up skipped, never the
+            # accuracy of one that gets searched.
+            if p < 0 and not in_check and not is_cap:
+                gives_check_direct = _gives_check_direct(bb, meta, f, t, p, moving_pt)
+                if not gives_check_direct:
+                    if futile:
+                        # A quiet move at a shallow, non-check node when even the best case
+                        # (static eval plus a depth-scaled margin) can't reach alpha -- skip it
+                        # outright rather than spend a board copy and a search on it. oi == 0 (the
+                        # hash/best-ordered move) is never skipped, so this node always has at
+                        # least one fully-searched move to report a score from.
+                        continue
+                    if depth <= LMP_MAX_DEPTH and oi >= LMP_THRESHOLD[depth]:
+                        # Late move pruning: this far into the ordering at a shallow depth,
+                        # TT/killer/history/counter-move ordering has already almost certainly put
+                        # every move worth searching ahead of this one -- skip outright rather than
+                        # even the reduced-depth probe LMR below would spend on it. LMP_THRESHOLD
+                        # grows with depth so a deeper (more expensive, more trustworthy) node
+                        # tolerates more late moves before pruning.
+                        continue
 
-            if (
-                depth <= LMP_MAX_DEPTH
-                and oi >= LMP_THRESHOLD[depth]
-                and p < 0
-                and not in_check
-                and not gives_check
-                and not is_cap
-            ):
-                # Late move pruning: this far into the ordering at a shallow depth, TT/killer/
-                # history/counter-move ordering has already almost certainly put every move worth
-                # searching ahead of this one -- skip outright rather than even the reduced-depth
-                # probe LMR below would spend on it. LMP_THRESHOLD grows with depth so a deeper
-                # (more expensive, more trustworthy) node tolerates more late moves before pruning.
-                continue
+            new_bb, new_meta = make_move(bb, meta, f, t, p)
+            gives_check = is_check(new_bb, new_meta)
+            if ext_budget > 0 and gives_check:
+                child_depth = depth
+                child_ext_budget = ext_budget - 1
+            else:
+                child_depth = depth - 1
+                child_ext_budget = ext_budget
 
             reduction = 0
             if (
@@ -1090,7 +1202,7 @@ def negamax(
         if best > alpha:
             alpha = best
         if alpha >= beta:
-            if p < 0 and not is_capture(bb, meta, f, t):
+            if p < 0 and not is_cap:
                 bonus = depth * depth
                 if not (f == k1_from and t == k1_to and p == k1_promo):
                     killer_from[ply, 1], killer_to[ply, 1], killer_promo[ply, 1] = (
@@ -1110,11 +1222,11 @@ def negamax(
                 # which matters most in exactly the sharp, many-candidate tactical positions this
                 # tier exists for.
                 for oi2 in range(oi):
-                    idx2 = order[oi2]
+                    idx2 = picked_idx[oi2]
                     f2 = _i64(from_arr[idx2])
                     t2 = _i64(to_arr[idx2])
                     p2 = _i64(promo_arr[idx2])
-                    if p2 < 0 and not is_capture(bb, meta, f2, t2):
+                    if p2 < 0 and not move_is_cap[oi2]:
                         history_table[f2 * 64 + t2] -= bonus
             break
 
@@ -1364,11 +1476,15 @@ def search_root(
     scores = _score_moves(bb, meta, from_arr, to_arr, promo_arr, count, pv_from, pv_to, pv_promo)
     order = np.argsort(-scores)
 
-    if depth <= 2 or prev_score == NO_PREV_SCORE or abs(prev_score) >= MATE_STORE_THRESHOLD:
-        alpha, beta = -INF, INF
+    use_aspiration = (
+        depth > 2 and prev_score != NO_PREV_SCORE and abs(prev_score) < MATE_STORE_THRESHOLD
+    )
+    window_idx = 0
+    if use_aspiration:
+        alpha = max(-INF, prev_score - ASPIRATION_WINDOWS[window_idx])
+        beta = min(INF, prev_score + ASPIRATION_WINDOWS[window_idx])
     else:
-        alpha = max(-INF, prev_score - ASPIRATION_WINDOW)
-        beta = min(INF, prev_score + ASPIRATION_WINDOW)
+        alpha, beta = -INF, INF
 
     while True:
         best_from, best_to, best_promo, best_score, completed = _search_root_pass(
@@ -1382,7 +1498,12 @@ def search_root(
         if not completed:
             return best_from, best_to, best_promo, best_score, False
         if (best_score <= alpha and alpha > -INF) or (best_score >= beta and beta < INF):
-            alpha, beta = -INF, INF
+            window_idx += 1
+            if window_idx < len(ASPIRATION_WINDOWS):
+                alpha = max(-INF, prev_score - ASPIRATION_WINDOWS[window_idx])
+                beta = min(INF, prev_score + ASPIRATION_WINDOWS[window_idx])
+            else:
+                alpha, beta = -INF, INF
             continue
         return best_from, best_to, best_promo, best_score, True
 

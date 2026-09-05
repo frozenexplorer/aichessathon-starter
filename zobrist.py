@@ -6,6 +6,8 @@ within one run.
 import numpy as np
 from numba import njit
 
+from movegen import _bit_scan
+
 _RNG = np.random.default_rng(0xC5E55A7)
 
 
@@ -25,12 +27,18 @@ ONE = np.uint64(1)
 
 @njit(cache=False)
 def position_hash(bb: np.ndarray, meta: np.ndarray) -> np.uint64:
+    """Phase 2.3 of docs/plan.md: iterate only the set bits of each piece bitboard (via the
+    `_llvm_cttz64`-backed `_bit_scan`, ~32 iterations for a full board) instead of scanning all 64
+    squares regardless of occupancy -- called on every negamax node plus twice per candidate move
+    in claim_eligible_for_opponent, so this is one of the hottest loops in the engine.
+    """
     h = np.uint64(0)
     for i in range(12):
-        piece_bb = bb[i]
-        for square in range(64):
-            if piece_bb & (ONE << np.uint64(square)):
-                h ^= PIECE_KEYS[i, square]
+        remaining = bb[i]
+        while remaining:
+            square = _bit_scan(remaining)
+            h ^= PIECE_KEYS[i, square]
+            remaining &= remaining - ONE
     if meta[0] == 1:
         h ^= TURN_KEY
     for i in range(4):
