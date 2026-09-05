@@ -806,7 +806,7 @@ pruning, SEE, LMR, search extensions, magic bitboards) are the Tier 2 work above
 reasons in the Tier 2 section above, not for lack of time -- see there before picking any of them
 back up.
 
-Tiers 3-13 are further passes beyond FUTURE.md's original list, none of them tracked in that file
+Tiers 3-15 are further passes beyond FUTURE.md's original list, none of them tracked in that file
 -- see each one's own section above for what it covers and why. In short, two rounds of further
 ideas were proposed and fully worked through, one item at a time with the full gate re-run after
 each: the first round (Tier 3) added mobility eval, futility pruning, a bigger two-tier TT, IID,
@@ -821,7 +821,21 @@ pruning, late move pruning), Tier 10 (fifty-move-rule draw detection), Tier 11 (
 material draw detection), Tier 12 (a `timeman.py` move-overhead safety margin), and Tier 13
 (singular extensions, the highest-risk item on the list, done last and most carefully).
 
-That closes out every item raised across both rounds. Still not picked up: generating a small
-custom endgame tablebase locally via retrograde analysis instead of downloading one (item 8's
-blocker) -- multi-day scope, not worth it against the time remaining unless everything else is
-done early.
+That closed out every item raised across both rounds. A third round followed: Tier 13 was
+profiled, trial-reverted for init-time margin once real platform numbers made that a live concern,
+then restored once a head-to-head match showed the revert cost more real strength than the tighter
+margin was worth -- see "Known risk: init-time margin" above for the full round trip. A direct
+"increase power without touching init time" request produced Tier 14 (TT size doubled, a tempo
+bonus, opposite-coloured-bishop draw scaling -- all zero/near-zero compile cost) and Tier 15 (Lazy
+SMP multi-threaded search and a branching-factor early stop, both validated with standalone
+feasibility probes before writing any real code) -- see their own sections above. Two related
+investigations from that same round concluded "no change is the right call": an empirical
+`timeman.py` constant tournament (current defaults beat every candidate tried) and a real Texel
+eval-weight-tuning pipeline (built and confirmed feasible, but its first run's results showed
+overfitting and were deliberately not applied -- a larger dataset would be needed to trust it).
+
+Still not picked up: generating a small custom endgame tablebase locally via retrograde analysis
+instead of downloading one (item 8's blocker) -- multi-day scope, not worth it against the time
+remaining unless everything else is done early. A properly-sized Texel tuning run (thousands of
+positions from deeper self-play games, a multi-hour undertaking) is the other explicitly-deferred
+item, per Tier 15's own section above.
