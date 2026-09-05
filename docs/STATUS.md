@@ -750,6 +750,126 @@ Init time measured compile-cost-neutral for the free fixes (SMP/TT) as designed,
 real but small extra branches in `negamax`'s own compiled control flow, not a new technique built
 from scratch the way singular extensions was.
 
+## Tier 17: init-time recovery -- the real mechanism was duplicate specialisations, not size
+
+Tier 16 pushed init time over budget (`+2-3%` per its own section above, on top of an
+already-tight ~85s real-platform margin) and this repo had **no committed benchmark of any
+kind** to catch it -- every number in this doc came from throwaway runs. `docs/plan.md` is the
+full writeup; this section is the summary.
+
+**Phase 0.** Two scripts landed first, both committed: `tests/bench_init.py` (imports `agent`
+once, patches `numba.core.dispatcher.Dispatcher.compile` to time every call, then dumps
+`.signatures` off every dispatcher in `search`/`movegen`/`evaluate`/`zobrist` -- the actual
+regression guard that was missing) and `tests/bench_nodes.py` (fixed-time iterative deepening on
+three FENs -- the Tier-1 blunder position, a quiet middlegame, and a king/pawn endgame -- reporting
+nodes/depth/rate, for accepting or rejecting anything that touches search or movegen speed).
+Baseline on this dev machine: **`TOTAL_IMPORT_SEC` 162.61s**, and the signature dump showed **23
+functions compiling more than one specialisation** -- `negamax` (9), `quiescence` (117 across all
+its recursive call-site variants), `attacked_by` (44 across castling-square literals),
+`bishop_attacks`/`rook_attacks` (~12 each), plus `occ_color`/`piece_type_at`/`king_square`/
+`make_move` and several smaller helpers (4 each). This is the part the previous entry in this doc
+(the "Known risk: init-time margin" section above) got wrong: it attributes the cost to
+`negamax`/`generate_legal`'s sheer *size*, and that framing is real but incomplete -- size sets a
+floor, duplicate compiles above that floor were the actual regression, and they are what actually
+moved between tiers, not the functions getting bigger.
+
+**The mechanism, in both directions plan.md documents:**
+
+- **(a) `Literal[int]` from bare Python int constants/literals.** Numba types a *literal* int
+  crossing an njit call boundary as `Literal[int](value)`, a distinct type per value -- so
+  `WHITE`/`BLACK` (`bitboard.py`) and the castling-square literals (`movegen.py`'s
+  `generate_pseudo_legal`) each minted their own specialisation of everything downstream
+  (`occ_color`, `king_square`, `attacked_by`, and transitively `bishop_attacks`/`rook_attacks`,
+  which turned out to have **no** real benefit from staying `Literal`-specialised -- it's a flat
+  array lookup either way, so this was accidental, not a deliberate fast path worth keeping).
+  Fixed via `bitboard.i64(value)`: returns a runtime `np.int64` while its return type annotation
+  lies and says plain `int`, so mypy stays clean on every `Dispatcher.__call__` site downstream
+  (numba-stubs models a dispatcher's expected argument types from the wrapped function's own type
+  hints, and a bare `numpy.signedinteger` doesn't satisfy an `int`-annotated parameter).
+- **(b) `int8` (from the `from_arr`/`to_arr`/`promo_arr` move arrays) vs `int64` (from `meta[0]`
+  reads, arithmetic, and plain-Python callers) drift** on every from/to/color argument threaded
+  through `is_capture`, `piece_type_at`, `make_move`, `has_non_pawn_material`, and `negamax`'s own
+  `parent_from`/`parent_to`/`excluded_from`/`excluded_to`. The instinctive fix -- Python's `int(...)`
+  -- turned out to be a trap: numba treats `int(x)` as a no-op identity conversion when `x` is
+  already some integer type, so `int(meta[0])` stays `int8`, not `int64` (confirmed the hard way,
+  mid-session, when swapping to it for mypy compliance silently regressed 17 functions back to
+  multiple specialisations). The actual fix is `movegen._i64(v)`, a dedicated one-line `@njit`
+  function whose own `np.int64(...)` return forces real widening regardless of input width, usable
+  from *inside* other njit function bodies where `bitboard.i64` (plain Python) cannot be called at
+  all (numba cannot call an untyped Python function in nopython mode).
+- A third, smaller case of the same family: `evaluate._ray_pin_score` took a `use_bishop: bool`
+  picking `bishop_attacks` vs `rook_attacks`, which numba compiles as two full specialisations
+  (`Literal[bool](True)`/`Literal[bool](False)`) of an otherwise-identical ~25-line body. Split into
+  `_ray_pin_score_bishop`/`_ray_pin_score_rook`, each with one fixed attack-table call.
+
+**Result: the signature audit now shows exactly one specialisation per function, zero exceptions**
+(including `bishop_attacks`/`rook_attacks`, which plan.md flagged as a *possible* acceptable
+exception if collapsing them cost real compile time for no gain -- it didn't, so they're collapsed
+too). `TOTAL_IMPORT_SEC` dropped **162.61s -> ~91s on this dev machine (44%)**, entirely from Phase
+1.1's specialisation collapse plus three small, independent, cheap items done alongside it per
+`docs/plan.md`'s own sequencing:
+
+- **1.4** (`agent.py`, before any numba-importing module loads): `NUMBA_OPT=1` +
+  `NUMBA_LOOP_VECTORIZE=0` + `NUMBA_SLP_VECTORIZE=0`, ~9% less compile time on this dev machine,
+  confirmed **zero node-rate change** via `tests/bench_nodes.py` before/after (this is the same
+  `NUMBA_OPT=1` flag Tier 1's own investigation above tried and found "no measurable effect" --
+  true at the time, since the duplicate-specialisation cost this tier fixes was masking it; with
+  that cost gone, the flag's own effect is now visible).
+- **1.5** (`attacks.py` + new `weights/attacks.npz`, 60,588 B compressed): `ROOK_ATTACK_TABLE`/
+  `BISHOP_ATTACK_TABLE` used to rebuild at every import via 107,648 Python-to-njit dispatched
+  ray-cast calls -- the only reason `_rook_ray_attacks`/`_bishop_ray_attacks` were `@njit` at all.
+  They ship precomputed now; the ray-cast builders are plain Python, kept only for
+  `tests/test_magic_attacks.py`'s differential oracle and for regenerating the file, with an
+  XOR-reduce checksum asserted at import so a corrupt/stale `.npz` fails loudly.
+- **1.8** (`search.py`, TT allocation): stores `real_depth + 1` so `0` means empty, letting
+  `new_tt()` zero-init every array (`np.zeros`) instead of eagerly `np.full(-1)`-writing four of
+  them -- ~117 MB less RSS, no behaviour change.
+
+Also, from `docs/plan.md`'s dead-code list (Phase 1.6/1.7, no init-time or strength effect, just
+less for a judge to read and fewer live hazards): **all of Lazy SMP deleted** (`agent.py`'s
+`_helper_worker`/`_spawn_helpers`/`SMP_THREADS`, `search.py`'s `nogil=True` on `search_root`, both
+modules' docstring sections, `tests/test_lazy_smp.py`) -- `SMP_THREADS = 1` (Tier 16) had already
+made all of it dead, unreachable code; `evaluate.warm_up()` (never called by anything); the three
+unused `pv_from`/`pv_to`/`pv_promo` parameters of `_search_root_pass`; the duplicate `_bit_scan`
+(`search.py`/`evaluate.py`) and `_popcount64` (`movegen.py`/`evaluate.py`), now one home each in
+`movegen.py`. **`_warm_up`** (`agent.py`) had its own live hazard fixed: `_search_restricted` (the
+tablebase-narrowed endgame path) called `negamax`/`is_capture`/`piece_type_at` directly from
+Python with a bare `meta[0]` and plain ints, a code path `_warm_up` never exercised -- a genuine
+"the 391-line `negamax` could recompile from scratch mid-game, on the clock" risk, not just an
+init-time nit. With every relevant argument now normalised to a single `int64` specialisation, that
+path already lands on the same compiled code as the main search, and `_warm_up` now also exercises
+it explicitly as a cheap assertion of that fact. Its own three already-redundant warm calls
+(`generate_legal`/`quiescence`/`claim_eligible_for_opponent`, each already compiled by its own
+`search_root` call one line above) were dropped, and the stale "60s init budget" docstring line
+corrected to 90s.
+
+**Not done: Phase 1.2/1.3** (splitting `generate_pseudo_legal`/`negamax`, consolidating negamax's
+three near-identical recursive call sites) -- `docs/plan.md`'s own sequencing gates these behind
+"only if 1.1 + the cheap items have not bought enough margin," and 1.1 alone bought a 44% cut with
+zero remaining duplicate specialisations, judged sufficient without touching either function's
+control flow, which is exactly the kind of change most likely to introduce a subtle correctness bug
+under time pressure for a benefit that isn't needed.
+
+**Verified:** `ruff`/`mypy --strict` clean (explicitly re-run against `movegen.py`/`evaluate.py`/
+`search.py` too, not just the `agent.py`/`harness` `mypy` `files` config covers by default --
+`docs/plan.md` flags this as a real gap, still open); `tests/perft.py` (0 mismatches, all depths);
+`tests/test_magic_attacks.py` (25,600/25,600 attack queries agree against the plain-Python ray-cast
+oracle, confirming the shipped `weights/attacks.npz` and the njit magic-lookup path still produce
+identical attacks); all 10 other `tests/*.py` scripts pass. `tests/bench_nodes.py` node rate is flat
+across the whole tier within normal run-to-run noise on this dev machine (~27k-30k nodes/s on the
+blunder FEN across five separate runs spanning before/after every item above) -- no regression from
+either the env flags or the new `_i64`/`i64` cast helpers added to the hot path.
+
+**Known, expected limitation, not a regression:** this dev machine's local `harness.arena`/
+`harness.play`/`harness.gate` still report `AgentFailure("init")` at ~91s against
+`harness/rules.py`'s hardcoded, deliberately-never-edited `INIT_BUDGET_S = 60.0` -- this dev machine
+has run measurably slower than the real platform throughout this project (the ~2.4x ratio implied
+by comparing this doc's own historical dev-machine numbers against the real ~85s platform figure
+`Tier 16`'s section above cites), so 91s here is estimated at roughly **~38s on the real platform**,
+comfortable under the real 90s cap with far more margin than Tier 16 left. This is the same
+dev-machine-vs-platform gap this doc's "Known risk: init-time margin" section has documented since
+Tier 1 -- unchanged in kind, just on the right side of it now instead of the wrong one.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
