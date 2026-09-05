@@ -1,8 +1,8 @@
 # Status
 
-Handoff snapshot as of the Tier 13 pass, restored after a trial revert (2026-09-05), on top of
-Tiers 1-12 (Tier 2 commit `02ec418`, Tier 1 commit `12a38f9`), all documented in their own sections
-below. Read this instead of replaying the whole build history.
+Handoff snapshot as of the Tier 15 pass (2026-09-05), on top of Tiers 1-14 (Tier 2 commit
+`02ec418`, Tier 1 commit `12a38f9`), all documented in their own sections below. Read this instead
+of replaying the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
 08:00-22:00; Daily Five runs 2026-09-06 through 2026-09-10.
 
@@ -11,14 +11,19 @@ matter of policy (see "Known risk: init-time margin" below), but real platform n
 during Tier 13 (~85s init against a real 90s cap) and briefly made this a live decision rather than
 a purely theoretical one -- see that same section for the profiling, the trial removal of singular
 extensions, the head-to-head match that measured its real strength cost, and why it was restored
-rather than left out. Each Tier 3+ item below was still verified with the full correctness gate
+rather than left out. Tiers 14-15 were built under an explicit "increase power, leave init time
+alone" request following that episode -- see their own sections for what was validated before
+writing any code (Lazy SMP in particular rests on two standalone feasibility probes, not
+assumption) and the two related tuning investigations that concluded "no change" is itself the
+right call for now. Each Tier 3+ item below was still verified with the full correctness gate
 (`ruff`, `mypy --strict`, `tests/perft.py`,
 `tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`, from Tier 5 onward
 `tests/test_threats.py`, from Tier 6 onward `tests/test_quiescence_check.py`, from Tier 8 onward
 `tests/test_king_safety.py`, from Tier 10 onward `tests/test_fifty_move.py`, from Tier 11 onward
-`tests/test_insufficient_material.py`, from Tier 12 onward `tests/test_timeman.py`, and from
-Tier 13 onward `tests/test_singular_extension.py`) plus functional games (checkmates from the
-start position and the KBN-vs-K tablebase endgame, both colours) before moving to the next.
+`tests/test_insufficient_material.py`, from Tier 12 onward `tests/test_timeman.py`, from Tier 13
+onward `tests/test_singular_extension.py`, from Tier 14 onward `tests/test_tempo_and_ocb.py`, and
+from Tier 15 onward `tests/test_lazy_smp.py`) plus functional games (checkmates from the start
+position and the KBN-vs-K tablebase endgame, both colours) before moving to the next.
 
 ## Architecture
 
@@ -39,24 +44,31 @@ evaluate.py     tapered material + PST (midgame/endgame king blend by game phase
                 bishop pair, rook open/semi-open files, king pawn-shield, differential piece
                 mobility, king proximity to passed-pawn promotion squares, tactical threat
                 awareness (hanging pieces, pawn threats, forks, absolute pins, x-rays/skewers),
-                king safety (attacker-weighted pressure on each king's own ring) -- all jitted
+                king safety (attacker-weighted pressure on each king's own ring), a flat tempo
+                bonus for the side to move, opposite-coloured-bishop draw scaling -- all jitted
 zobrist.py      position hashing, for repetition detection and the transposition table
-search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table,
-                killer-move + history (with malus) + counter-move ordering, principal variation
-                search (PVS) with aspiration windows, null-move pruning, late move reductions and
-                pruning, check extensions, singular extensions (excluded-move verification
-                search), futility and reverse-futility/static-null pruning, internal iterative
-                deepening, static exchange evaluation (move ordering + quiescence SEE/delta
-                pruning), quiescence (including a bounded full-width search of check evasions, not
-                just captures, when the side to move is in check), repetition/fifty-move/
-                insufficient-material draw scoring, panic-mode fallback
+search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table (4M
+                buckets, ~160MB), killer-move + history (with malus) + counter-move ordering,
+                principal variation search (PVS) with aspiration windows, null-move pruning, late
+                move reductions and pruning, check extensions, singular extensions (excluded-move
+                verification search), futility and reverse-futility/static-null pruning, internal
+                iterative deepening, static exchange evaluation (move ordering + quiescence
+                SEE/delta pruning), quiescence (including a bounded full-width search of check
+                evasions, not just captures, when the side to move is in check),
+                repetition/fifty-move/insufficient-material draw scoring, panic-mode fallback;
+                search_root compiled nogil=True for Lazy SMP (see agent.py)
 tablebase.py    Syzygy WDL + DTZ, root-only -- WDL filters to won/drawn-safe moves, DTZ narrows
                 further to the ones that actually make progress
 timeman.py      per-move budget (adaptive: a volatile position -- score swinging between
                 iterations, in check, a capture just played, or few pieces left -- can spend up
                 to timeman.EXTENSION_FACTOR times the base budget) + a hard low-clock panic
                 threshold; two stacked safety reservations (clock-proportional SAFETY_MARGIN_MS,
-                fixed POST_SEARCH_BUFFER_MS for real post-search-loop work)
+                fixed POST_SEARCH_BUFFER_MS for real post-search-loop work); constants checked
+                against a small empirical self-play tournament (Tier 15), no change warranted
+agent.py        Lazy SMP: up to SMP_THREADS-1 helper threads run search_root concurrently with
+                the main thread's own iterative-deepening loop, sharing the TT, each with its own
+                history/killer/counter-move tables; a branching-factor early stop skips starting
+                a depth very unlikely to complete before its deadline
 tests/perft.py               movegen verified against python-chess: differential testing over
                               random games (6 position types incl. Kiwipete) + perft node counts
 tests/test_repetition.py     direct unit tests of the repetition-draw and claim-eligibility logic
@@ -81,6 +93,12 @@ tests/test_singular_extension.py  negamax's excluded-move mechanism: an excluded
                               returns a sane score and never stores to the TT under its own
                               position's key, while its own real-move children still store to
                               theirs normally
+tests/test_tempo_and_ocb.py  the tempo-bonus invariant (evaluate(white-to-move) +
+                              evaluate(black-to-move) sums to exactly 2*TEMPO_BONUS regardless of
+                              material) and all four opposite-bishop draw-scaling cases
+tests/test_lazy_smp.py       a real self-play game with Lazy SMP active: every move legal, zero
+                              helper-thread exceptions, a large number of TT entries written as
+                              proof the helper threads actually ran concurrently
 ```
 
 Everything under `weights/syzygy/` and every `.py` file above ships in the zip (`make zip`);
@@ -513,6 +531,95 @@ bug in the test itself during development (an earlier draft asserted nothing was
 which is wrong: children legitimately write under their own keys) before the assertion was
 narrowed to the actual invariant that matters.
 
+## Tier 14: three zero-init-cost strength additions
+
+Prompted by a direct ask to increase strength without touching the init-time lever, after Tier 13's
+init-time investigation above -- see that section for why init time briefly became a live concern
+and why it settled where it did. All three are pure constants or near-zero-compile-cost eval
+additions, not new search control flow, so none of them meaningfully move init time on their own:
+
+1. **TT size doubled** (`search.py`) -- `TT_BUCKETS` 2M -> 4M buckets (~80MB -> ~160MB). A pure
+   array-size constant; the compiled code is identical either way, so this costs nothing at init
+   beyond a slightly larger allocation/zeroing at `new_tt()` time. Fewer collisions over a full
+   game's worth of nodes, kept to a modest doubling rather than a larger multiple since the
+   platform's real memory ceiling is not known.
+2. **Tempo bonus** (`evaluate.py`) -- a flat `TEMPO_BONUS` added to `evaluate()`'s return value,
+   after the mover-perspective sign flip, so it always rewards whoever's turn it is. One line.
+3. **Opposite-coloured-bishop draw scaling** (`evaluate.py`) -- `opposite_bishops_scale` scales the
+   whole eval down to `OCB_SCALE_PERCENT` percent in a pure OCB endgame (exactly one bishop each, on
+   opposite-coloured squares, no other minor or major piece for either side): these are famously
+   drawish even a material edge up, since the bishops can never contest the same squares. Deliberately
+   scoped to bishops-and-pawns-only endgames -- OCB alongside a rook or queen does not carry the same
+   drawish tendency, confirmed by a dedicated test case that a rook present suppresses the scaling.
+
+New test: `tests/test_tempo_and_ocb.py` -- the tempo invariant (`evaluate(white-to-move) +
+evaluate(black-to-move)` on the same position sums to exactly `2 * TEMPO_BONUS` regardless of any
+material imbalance, since the imbalance term cancels out of the sum) and all four OCB scale cases
+(opposite colours scales, same colours does not, OCB plus a rook does not, no bishops does not).
+
+## Tier 15: Lazy SMP (nogil multi-threaded search) and a branching-factor early stop
+
+Two more items from the same "increase power, leave init time alone" request, both validated with
+standalone feasibility probes *before* touching real code, given how large and hard-to-reverse a
+mistake in either would be:
+
+1. **Lazy SMP.** `search_root` is now compiled `nogil=True`, and `agent.py`'s `_spawn_helpers`
+   starts up to `SMP_THREADS - 1` (capped at 4, `os.cpu_count()`-aware) helper threads per move, all
+   calling `search_root` concurrently with the main thread's own loop. Validated in two steps before
+   writing any of this: first, a synthetic CPU-bound `nogil=True` workload benchmarked at 5.4x
+   speedup across 8 threads on this machine, confirming numba's nogil actually releases the GIL for
+   real multi-core execution here rather than just in theory; second, a probe confirming numba
+   resolves an njit-to-njit call as a direct native call at the *callee's* own compile time, not
+   through the nogil-controlled Python-facing dispatcher wrapper -- meaning only `search_root`
+   itself (the one function agent.py calls directly) needed the decorator, not `negamax`/
+   `quiescence`/`evaluate`/etc. `_search_restricted` (the tablebase-narrowed endgame path) is
+   deliberately left single-threaded for this first pass.
+
+   Threads share the transposition table (the entire point) but nothing else: each gets its own
+   copy of `_history`/`_opponent_history` (negamax writes further entries onto whatever history
+   array it is given as it descends, so two threads sharing one array would corrupt each other's
+   in-search repetition detection -- a real correctness hazard, unlike the TT) and its own fresh
+   killer/history-heuristic/counter-move tables. Sharing the TT lock-free is a deliberate, standard
+   Lazy SMP tradeoff: a torn read can only produce the same class of "wrong info" a single-threaded
+   run already tolerates from an ordinary hash-index collision (a hint move that doesn't match any
+   move in the current position's own generated legal-move list, already skipped harmlessly rather
+   than trusted blindly) -- see search.py's module docstring for the full argument, including why
+   the individual TT fields cannot meaningfully tear on real hardware. Helper threads target
+   `base_deadline` (never the volatility-extended budget) and are always fully joined before a move
+   is returned, so they can only ever make a move later by the deadline-check overshoot margin
+   already priced into the timeman safety buffers, never leak, and never silently swallow an
+   exception (verified directly, see below).
+
+2. **Branching-factor early stop** (`agent.py`) -- before starting depth N+1, compare depth N's own
+   elapsed time against the time actually remaining; skip starting the next depth (return the
+   current best immediately) if even `BRANCHING_ESTIMATE` (4, deliberately conservative) times as
+   long would not fit. An aborted root search is discarded entirely regardless (search.py's own
+   docstring), so starting a depth with no real chance of finishing only wastes clock a future move
+   could have used instead -- a free improvement, not a strength/time tradeoff.
+
+New test: `tests/test_lazy_smp.py` -- plays a real 24-ply self-play game with Lazy SMP active,
+asserting every move returned is legal, zero helper-thread exceptions were raised (checked via a
+temporary `threading.excepthook` override, since `Thread.join()` alone does not surface them), and
+a large number of TT entries were written (54k+ in practice) as direct proof the helper threads
+actually ran concurrently rather than merely starting and no-opping.
+
+**Two related investigations, both concluding "no change," which is itself the useful result:**
+a small empirical tournament (4 candidate `timeman.py` constant settings, 8 games each, vs current
+defaults) found every candidate lost to the defaults -- the existing `EXTENSION_FACTOR`/
+`MAX_EXTENSION_FRACTION`/`ASSUMED_MOVES_LEFT`/`SAFETY_MARGIN_MS` values are already reasonably
+tuned, so nothing changed there. Separately, a real (not just proposed) Texel-tuning pipeline was
+built for `evaluate.py`'s weight constants -- confirmed feasible via a numba-recompile mechanism
+(mutating a module-level weight constant and recompiling only the specific function that reads it
+plus `evaluate()` itself, without needing to touch `negamax`/`quiescence`'s own compiled bodies at
+all, since tuning only ever calls `evaluate()` directly on a fixed position dataset) -- but the
+first real run (40 self-play games, 880 sampled positions, forced fast to stay tractable) produced
+weights with clear overfitting symptoms (`ROOK_OPEN_BONUS` tuned *below* `ROOK_SEMI_OPEN_BONUS`,
+inverting a basic chess principle; most bonuses cut roughly in half in a uniform pattern more
+consistent with fitting noise in a small, blunder-prone shallow-search dataset than with a real
+signal). Those tuned values were deliberately not applied. The pipeline itself is sound and
+reusable; a trustworthy run would need a much larger dataset (thousands of positions from deeper
+searches), which is a multi-hour undertaking not attempted in this pass.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -591,6 +698,17 @@ narrowed to the actual invariant that matters.
   crashes, no hangs, checkmates both colours -- meaningful here specifically, since a bug in the
   exclusion/recursion-termination logic could plausibly manifest as a hang rather than a wrong
   score). 8s-search throughput check shows a real, measured cost -- see the Tier 13 section above.
+- Tier 14: full gate (ruff, mypy --strict, perft, repetition, SEE, magic-attacks, threats,
+  quiescence-check, king-safety, fifty-move, insufficient-material, timeman, singular-extension)
+  plus the new `tests/test_tempo_and_ocb.py` all clean, plus functional games.
+- Tier 15: full gate (ruff, mypy --strict, all 13 test files including the new
+  `tests/test_lazy_smp.py`) clean, plus functional games (KBN-vs-K checkmate both colours, bounded
+  start-position self-play) with Lazy SMP and the branching-factor early stop both active. Also
+  specifically checked for what a threading change most needs and unit tests cannot easily catch:
+  `test_lazy_smp.py` overrides `threading.excepthook` for the duration of a real game to confirm
+  zero helper-thread exceptions (which `Thread.join()` alone would silently swallow), and confirms
+  54k+ TT entries were written in a single 24-ply game -- proof the helper threads actually ran
+  concurrently and shared the table, not just started and no-opped.
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
