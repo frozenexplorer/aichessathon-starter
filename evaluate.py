@@ -48,6 +48,20 @@ minor or major piece for either side) -- these are famously drawish even a mater
 the bishops can never contest the same squares, so an unscaled eval overstates real winning
 chances. Deliberately scoped to bishops-and-pawns-only endgames: OCB alongside rooks or queens does
 not carry the same drawish tendency, so those are left at full weight.
+
+Two more positional terms, both cheap (one pass over each side's own pieces, the same style as
+everything else here): `outpost_score` rewards a knight on a square an own pawn defends and no
+enemy pawn can ever capture it on (approximated via the same PASSED_MASK_WHITE/BLACK shape
+passed_pawn already builds -- see its own docstring for why that is a safe, conservative
+under-approximation, not an exact one); `space_and_storm_score` combines a flat bonus per own pawn
+advanced past the halfway line (a crude space/board-control proxy) with a pawn-storm bonus, scaled
+by how far advanced, for an own pawn on one of the three files around the enemy king -- both fade
+out via the same phase blend king_safety_score uses, for the same reason (a pawn storm or a space
+edge is a middlegame concern; a bare-king endgame is the king PST's territory instead). Deliberately
+does not add a separate "candidate passed pawn" term on top of the existing strict passed-pawn
+check above: the incremental value over what pawn_structure already detects was judged too small to
+justify a second, harder-to-verify pawn-structure heuristic in the same pass as everything else
+here.
 """
 
 import numpy as np
@@ -167,6 +181,10 @@ XRAY_HEAVY_DIVISOR = np.int32(10)
 KING_ZONE_ATTACK_WEIGHT = np.array([2, 20, 20, 30, 45, 0], dtype=np.int32)
 TEMPO_BONUS = np.int32(10)
 OCB_SCALE_PERCENT = np.int32(60)
+OUTPOST_BONUS = np.int32(20)
+SPACE_BONUS = np.int32(4)
+STORM_BONUS = np.int32(6)
+STORM_MIN_RANK = 4  # 0-indexed rank; 4 == the 5th rank from that side's own back rank
 
 
 def _build_file_masks() -> np.ndarray:
@@ -654,6 +672,96 @@ def opposite_bishops_scale(bb: np.ndarray) -> int:
 
 
 @njit(cache=False)
+def outpost_score(bb: np.ndarray) -> int:
+    """A knight on a square an own pawn defends, that no enemy pawn can ever capture it on, is a
+    well-known, hard-to-dislodge strongpoint. "Can ever capture it on" reuses PASSED_MASK_WHITE/
+    BLACK -- the same own-file-plus-adjacent-files-strictly-ahead shape passed_pawn already builds
+    -- rather than a new mask: a same-file enemy pawn ahead cannot actually capture onto the square
+    (only the adjacent-file part of the mask matters for that), so this is a deliberately
+    conservative approximation that can only ever miss a real outpost, never invent one, the same
+    direction every other conservative check in this module already takes.
+    """
+    score = np.int32(0)
+    white_pawns = bb[WHITE * 6 + PAWN]
+    black_pawns = bb[BLACK * 6 + PAWN]
+
+    white_pawn_attacks = np.uint64(0)
+    remaining = white_pawns
+    while remaining:
+        sq = _bit_scan(remaining)
+        remaining &= remaining - ONE
+        white_pawn_attacks |= PAWN_ATTACKS[WHITE, sq]
+
+    black_pawn_attacks = np.uint64(0)
+    remaining = black_pawns
+    while remaining:
+        sq = _bit_scan(remaining)
+        remaining &= remaining - ONE
+        black_pawn_attacks |= PAWN_ATTACKS[BLACK, sq]
+
+    remaining = bb[WHITE * 6 + KNIGHT]
+    while remaining:
+        sq = _bit_scan(remaining)
+        remaining &= remaining - ONE
+        bit = ONE << np.uint64(sq)
+        if white_pawn_attacks & bit and black_pawns & PASSED_MASK_WHITE[sq] == 0:
+            score += OUTPOST_BONUS
+
+    remaining = bb[BLACK * 6 + KNIGHT]
+    while remaining:
+        sq = _bit_scan(remaining)
+        remaining &= remaining - ONE
+        bit = ONE << np.uint64(sq)
+        if black_pawn_attacks & bit and white_pawns & PASSED_MASK_BLACK[sq] == 0:
+            score -= OUTPOST_BONUS
+
+    return int(score)
+
+
+@njit(cache=False)
+def space_and_storm_score(bb: np.ndarray, phase: int) -> int:
+    """Two simple, phase-faded terms sharing one pass over each side's pawns, since both only need
+    "for each own pawn, how far advanced is it and which file is it on": a flat bonus per own pawn
+    advanced past the halfway line (a crude space/board-control proxy -- a real space count would
+    also weight empty squares controlled but not occupied, deliberately skipped to keep this cheap
+    and low-risk) and a pawn-storm bonus, scaled by how far advanced, for an own pawn on one of the
+    three files around the ENEMY king. Both fade out via the same phase blend king_safety_score
+    uses and for the same reason: a pawn storm or a space edge matters while there is still an
+    enemy king position worth attacking around, not in a bare king endgame (the king PST's own
+    phase blend already covers that side of it).
+    """
+    if phase == 0:
+        return 0
+    score = np.int32(0)
+    white_pawns = bb[WHITE * 6 + PAWN]
+    black_pawns = bb[BLACK * 6 + PAWN]
+    bk_file = king_square(bb, BLACK) % 8
+    wk_file = king_square(bb, WHITE) % 8
+
+    remaining = white_pawns
+    while remaining:
+        sq = _bit_scan(remaining)
+        remaining &= remaining - ONE
+        f, rank = sq % 8, sq // 8
+        if rank >= 4:
+            score += SPACE_BONUS
+        if abs(f - bk_file) <= 1 and rank >= STORM_MIN_RANK:
+            score += STORM_BONUS * (rank - STORM_MIN_RANK + 1)
+
+    remaining = black_pawns
+    while remaining:
+        sq = _bit_scan(remaining)
+        remaining &= remaining - ONE
+        f, rank = sq % 8, sq // 8
+        if rank <= 3:
+            score -= SPACE_BONUS
+        if abs(f - wk_file) <= 1 and rank <= 7 - STORM_MIN_RANK:
+            score -= STORM_BONUS * ((7 - STORM_MIN_RANK) - rank + 1)
+
+    return int(score * phase // PHASE_MAX)
+
+
+@njit(cache=False)
 def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
     phase = game_phase(bb)
     score = (
@@ -665,6 +773,8 @@ def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
         + threats_score(bb)
         + pin_and_xray_score(bb)
         + king_safety_score(bb, phase)
+        + outpost_score(bb)
+        + space_and_storm_score(bb, phase)
     )
     score = score * opposite_bishops_scale(bb) // 100
     stm_score = int(score) if meta[0] == WHITE else int(-score)

@@ -101,14 +101,19 @@ matching how the same forcing-line reasoning already works for search extensions
 
 Late move reductions: inside negamax's move loop (never at the root -- search_root explores every
 root move at full depth), a quiet move late enough in the ordering (see LMR_MIN_MOVE_INDEX) gets
-searched one ply shallower first, on the premise that TT/killer/history ordering has already
-almost certainly put the moves worth full depth ahead of it. Only promotes to a full-depth
-re-search if the reduced probe still beats alpha, and from there falls into the same full-window
-PVS re-search as any other move that beats alpha -- so a reduction can only cost extra nodes
-re-confirming a move, never silently accept a wrong score, since the final accepted score for any
-move that raises alpha always comes from a full-depth search. Skipped entirely when the current
-node or the resulting position is in check, or the move is a capture or promotion -- exactly the
-tactical moves a shallower search is least equipped to judge.
+searched shallower first, on the premise that TT/killer/history ordering has already almost
+certainly put the moves worth full depth ahead of it. Only promotes to a full-depth re-search if
+the reduced probe still beats alpha, and from there falls into the same full-window PVS re-search
+as any other move that beats alpha -- so a reduction can only cost extra nodes re-confirming a
+move, never silently accept a wrong score, since the final accepted score for any move that raises
+alpha always comes from a full-depth search. Skipped entirely when the current node or the
+resulting position is in check, or the move is a capture or promotion -- exactly the tactical moves
+a shallower search is least equipped to judge. The reduction itself comes from LMR_TABLE, indexed
+by (depth, move index): the standard log(depth) * log(move index) shape real engines start from,
+rather than the previous flat one-ply reduction, so a move that is both very late and very deep
+gets reduced further than one just past the LMR_MIN_* thresholds, capped at LMR_MAX_REDUCTION. Pure
+lookup-table data built once at import (like FUTILITY_MARGIN/LMP_THRESHOLD above), so this changes
+nothing about negamax's own compiled control flow or init cost.
 
 Search extensions: a move that gives check gets its child searched at the same depth rather than
 depth - 1 -- a full ply deeper than normal, since a forced reply to check is exactly the kind of
@@ -135,6 +140,19 @@ move set, not the one this search is deliberately missing) or write one either: 
 early-return in _tt_resolve's caller and the end-of-function store are skipped whenever
 excluded_from >= 0, so the real TT entry for this position is exactly as if the verification search
 had never run.
+
+Multi-cut: rides on the exact verification search singular extensions above already pays for,
+reading its result the other way rather than running a second, separate reduced-depth search of
+its own. That search already excludes the hash move and asks whether anything else can reach
+singular_beta (a narrow window just below the hash move's own stored score); if the hash move
+turns out not to be singular (some other move reached singular_beta) AND singular_beta is itself
+>= the real beta, then two independent moves at this node -- the hash move (whose stored score
+backed a lower-bound/exact entry above singular_beta + margin) and the one the verification search
+just found -- both clear the real beta on their own. That is normally treated as strong enough
+evidence to cut the whole node without searching the rest of it, the same way a null-move cutoff
+does, and for the same reason: enough independent evidence of a fail-high that spending the full
+move loop to confirm it is very unlikely to pay for itself. Returns beta itself, not the possibly-
+higher singular_beta, matching null-move pruning's own conservative cutoff value below.
 
 Futility pruning: at a shallow node (depth <= FUTILITY_MAX_DEPTH) not in check, a quiet, non-check
 move is skipped outright once the static eval plus a depth-scaled margin still can't reach alpha
@@ -260,6 +278,7 @@ this). Nothing shared here can mask a real repetition or corrupt the claim-eligi
 -- both read from the independent, per-thread history arrays, never the TT.
 """
 
+import math
 import time
 
 import numpy as np
@@ -309,14 +328,31 @@ NULL_MOVE_MIN_DEPTH = 3
 NULL_MOVE_REDUCTION = 2
 
 # Late move reductions: a quiet move searched late in the ordering (oi >= LMR_MIN_MOVE_INDEX,
-# after the hash/killer/history-backed moves have already had their full-depth say) gets one ply
-# less depth first; only a reduced-depth score that still beats alpha earns a full-depth
-# re-search before PVS's own full-window re-search gets a chance. Deliberately conservative (a
-# fixed one-ply reduction, not depth- or move-count-scaled) since this sits on top of the
-# existing TT/killer/history ordering rather than replacing it -- see docs/FUTURE.md item 5.
+# after the hash/killer/history-backed moves have already had their full-depth say) gets less
+# depth first; only a reduced-depth score that still beats alpha earns a full-depth re-search
+# before PVS's own full-window re-search gets a chance -- see docs/FUTURE.md item 5.
 LMR_MIN_DEPTH = 3
 LMR_MIN_MOVE_INDEX = 3
-LMR_REDUCTION = 1
+
+# LMR_TABLE[depth][move_index] replaces a flat one-ply reduction with the standard depth/move-index
+# log-log formula (real engines' usual starting point): a move both late in the ordering and deep
+# in the tree earns a bigger reduction than one just barely past the LMR_MIN_* thresholds, since
+# the ordering (TT/killers/history/counter-move) is more likely to have already found the real
+# move by then. Capped at LMR_MAX_REDUCTION so a pathological depth/move-index combination can
+# never reduce so far that a real tactic falls out of the search; capped table dimensions (the
+# largest depth/move-index this search realistically reaches) with lookups clamped to them below,
+# not because a bigger index is wrong, just to keep the table itself small. Built once at import in
+# plain Python (like FUTILITY_MARGIN/LMP_THRESHOLD above) -- zero compile cost, this is data, not
+# control flow.
+LMR_TABLE_MAX_DEPTH = 64
+LMR_TABLE_MAX_MOVE_INDEX = 128
+LMR_MAX_REDUCTION = 4
+LMR_TABLE = np.zeros((LMR_TABLE_MAX_DEPTH + 1, LMR_TABLE_MAX_MOVE_INDEX + 1), dtype=np.int64)
+for _d in range(1, LMR_TABLE_MAX_DEPTH + 1):
+    for _m in range(1, LMR_TABLE_MAX_MOVE_INDEX + 1):
+        _r = int(0.5 + math.log(_d) * math.log(_m) / 2.25)
+        LMR_TABLE[_d, _m] = min(_r, LMR_MAX_REDUCTION)
+del _d, _m, _r
 
 # Search extensions: a move that gives check gets its child searched a full ply deep (depth is
 # not decremented) instead of the usual depth - 1, since a forced reply to check is exactly the
@@ -376,12 +412,12 @@ MAX_KILLER_PLY = 128
 # recency slot, so a fresh position from the current search is never simply dropped because the
 # depth-preferred slot happens to be occupied by something deeper). TT_BUCKETS is the addressable
 # bucket count (indexed by the low bits of the Zobrist hash); the arrays below are twice that many
-# raw slots. 4M buckets * 2 slots * 20 bytes/slot (parallel arrays below) is a fixed ~160MB,
+# raw slots. 8M buckets * 2 slots * 20 bytes/slot (parallel arrays below) is a fixed ~320MB,
 # independent of game length -- no growth, no eviction bookkeeping beyond the two-slot policy.
-# Doubled from 2M buckets (~80MB): fewer collisions over a full game's worth of nodes at no compile
-# or init cost (a pure array-size constant, same code either way) -- kept modest rather than a
-# larger multiple since the platform's real memory ceiling isn't known.
-TT_BUCKETS = 1 << 22
+# Doubled again from 4M buckets (~160MB): fewer collisions over a full game's worth of nodes at no
+# compile or init cost (a pure array-size constant, same code either way). The agent contract now
+# documents the real memory ceiling (2 GB), so this is a known-safe ~16% of it, not a guess.
+TT_BUCKETS = 1 << 23
 TT_SIZE = TT_BUCKETS * 2
 TT_MASK = np.uint64(TT_BUCKETS - 1)
 TT_EXACT = np.int8(0)
@@ -931,7 +967,21 @@ def negamax(
         )
         if counters[1]:
             return 0
-        singular_extension = verify_score < singular_beta
+        if verify_score < singular_beta:
+            singular_extension = True
+        elif singular_beta >= beta:
+            # Multi-cut: the verification search above already excludes the hash move and still
+            # found some OTHER move reaching singular_beta, which here is itself >= the real beta
+            # -- so at least two independent moves at this node can each reach beta on their own
+            # (the hash move's own stored score backs a lower-bound/exact entry that cleared
+            # hint_tt_score >= singular_beta + margin, and this other move clears singular_beta
+            # too). That is normally strong enough evidence to cut the whole node without
+            # searching the rest of it -- the same reduced-verification-search result the
+            # singular-extension check above already paid for, just read the other way, so this
+            # costs no extra search of its own. Returns beta itself (not the possibly-higher
+            # singular_beta), the same conservative bound null-move pruning below returns on its
+            # own cutoff.
+            return beta
 
     k1_from = int(killer_from[ply, 0])
     k1_to, k1_promo = int(killer_to[ply, 0]), int(killer_promo[ply, 0])
@@ -1014,7 +1064,9 @@ def negamax(
                 and not is_cap
                 and not gives_check
             ):
-                reduction = LMR_REDUCTION
+                d_idx = depth if depth < LMR_TABLE_MAX_DEPTH else LMR_TABLE_MAX_DEPTH
+                m_idx = oi if oi < LMR_TABLE_MAX_MOVE_INDEX else LMR_TABLE_MAX_MOVE_INDEX
+                reduction = int(LMR_TABLE[d_idx, m_idx])
 
             score = -negamax(
                 new_bb, new_meta, child_depth - reduction, -alpha - 1, -alpha, deadline, counters,

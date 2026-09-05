@@ -59,7 +59,6 @@ used instead; BRANCHING_ESTIMATE is deliberately conservative so this only ever 
 were very unlikely to complete anyway.
 """
 
-import os
 import threading
 import time
 
@@ -84,11 +83,16 @@ MAX_DEPTH = 64
 # have completed anyway, not one with a real chance.
 BRANCHING_ESTIMATE = 4
 
-# Capped modestly rather than at os.cpu_count() itself: the platform's real core count and load
-# are unknown, TT contention gives diminishing returns past a handful of threads anyway (see the
-# nogil-parallelism benchmark this was validated against before adding), and a lower number leaves
-# headroom for the harness/OS on whatever hardware this actually lands on.
-SMP_THREADS = max(1, min(4, os.cpu_count() or 1))
+# Hardcoded, not os.cpu_count()-derived: the agent contract guarantees exactly one core, and
+# os.cpu_count() reports the host's total logical CPUs, not a cgroup/quota-limited allotment --
+# on a real container restricted to one core via quota (the normal mechanism, not CPU pinning) it
+# would very likely still report the underlying host's full core count, so trusting it here would
+# spawn helper threads that only ever time-slice the single core actually available: pure
+# contention with the main thread for zero real parallelism, precisely the "more threads than
+# cores" mistake docs/IDEAS.md calls out by name. SMP_THREADS - 1 helper threads are spawned below,
+# so this leaves Lazy SMP's machinery in place (see agent.py/search.py module docstrings) but
+# inert, a one-line flip if a future contract ever documents more than one core.
+SMP_THREADS = 1
 
 _history = np.zeros(sr.HISTORY_CAPACITY, dtype=np.uint64)
 _history_len = 0
