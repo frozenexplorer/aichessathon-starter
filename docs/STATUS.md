@@ -1,6 +1,6 @@
 # Status
 
-Handoff snapshot as of the Tier 15 pass (2026-09-05), on top of Tiers 1-14 (Tier 2 commit
+Handoff snapshot as of the Tier 16 pass (2026-09-05), on top of Tiers 1-15 (Tier 2 commit
 `02ec418`, Tier 1 commit `12a38f9`), all documented in their own sections below. Read this instead
 of replaying the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
@@ -15,8 +15,12 @@ rather than left out. Tiers 14-15 were built under an explicit "increase power, 
 alone" request following that episode -- see their own sections for what was validated before
 writing any code (Lazy SMP in particular rests on two standalone feasibility probes, not
 assumption) and the two related tuning investigations that concluded "no change" is itself the
-right call for now. Each Tier 3+ item below was still verified with the full correctness gate
-(`ruff`, `mypy --strict`, `tests/perft.py`,
+right call for now. Tier 16 re-verified the live contract directly (`aichessathon.com/docs`) rather
+than trusting this repo's own `AGENTS.md`/`harness/rules.py`, which had drifted stale -- confirmed
+the init budget really is 90s (not the 60s `harness/rules.py` still enforces locally) and the
+hardware really is one core (not something `os.cpu_count()` can be trusted to detect), which
+directly motivated hardcoding `SMP_THREADS = 1` -- see that section. Each Tier 3+ item below was
+still verified with the full correctness gate (`ruff`, `mypy --strict`, `tests/perft.py`,
 `tests/test_repetition.py`, `tests/test_see.py`, `tests/test_magic_attacks.py`, from Tier 5 onward
 `tests/test_threats.py`, from Tier 6 onward `tests/test_quiescence_check.py`, from Tier 8 onward
 `tests/test_king_safety.py`, from Tier 10 onward `tests/test_fifty_move.py`, from Tier 11 onward
@@ -45,18 +49,22 @@ evaluate.py     tapered material + PST (midgame/endgame king blend by game phase
                 mobility, king proximity to passed-pawn promotion squares, tactical threat
                 awareness (hanging pieces, pawn threats, forks, absolute pins, x-rays/skewers),
                 king safety (attacker-weighted pressure on each king's own ring), a flat tempo
-                bonus for the side to move, opposite-coloured-bishop draw scaling -- all jitted
+                bonus for the side to move, opposite-coloured-bishop draw scaling, knight outpost
+                bonus, a space/pawn-storm term (Tier 16) -- all jitted
 zobrist.py      position hashing, for repetition detection and the transposition table
-search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table (4M
-                buckets, ~160MB), killer-move + history (with malus) + counter-move ordering,
-                principal variation search (PVS) with aspiration windows, null-move pruning, late
-                move reductions and pruning, check extensions, singular extensions (excluded-move
-                verification search), futility and reverse-futility/static-null pruning, internal
-                iterative deepening, static exchange evaluation (move ordering + quiescence
-                SEE/delta pruning), quiescence (including a bounded full-width search of check
-                evasions, not just captures, when the side to move is in check),
+search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table (8M
+                buckets, ~320MB), killer-move + history (with malus) + counter-move ordering,
+                principal variation search (PVS) with aspiration windows, null-move pruning,
+                adaptive (depth/move-index table-driven, Tier 16) late move reductions and
+                pruning, check extensions, singular extensions (excluded-move verification
+                search) plus a multi-cut cutoff riding on that same verification search (Tier
+                16), futility and reverse-futility/static-null pruning, internal iterative
+                deepening, static exchange evaluation (move ordering + quiescence SEE/delta
+                pruning), quiescence (including a bounded full-width search of check evasions,
+                not just captures, when the side to move is in check),
                 repetition/fifty-move/insufficient-material draw scoring, panic-mode fallback;
-                search_root compiled nogil=True for Lazy SMP (see agent.py)
+                search_root compiled nogil=True for Lazy SMP (see agent.py -- inert on the real
+                platform as of Tier 16, SMP_THREADS hardcoded to 1)
 tablebase.py    Syzygy WDL + DTZ, root-only -- WDL filters to won/drawn-safe moves, DTZ narrows
                 further to the ones that actually make progress
 timeman.py      per-move budget (adaptive: a volatile position -- score swinging between
@@ -68,7 +76,9 @@ timeman.py      per-move budget (adaptive: a volatile position -- score swinging
 agent.py        Lazy SMP: up to SMP_THREADS-1 helper threads run search_root concurrently with
                 the main thread's own iterative-deepening loop, sharing the TT, each with its own
                 history/killer/counter-move tables; a branching-factor early stop skips starting
-                a depth very unlikely to complete before its deadline
+                a depth very unlikely to complete before its deadline. SMP_THREADS hardcoded to 1
+                as of Tier 16 (the confirmed real platform is one core; see that section) --
+                the machinery above stays in place but spawns zero helper threads
 tests/perft.py               movegen verified against python-chess: differential testing over
                               random games (6 position types incl. Kiwipete) + perft node counts
 tests/test_repetition.py     direct unit tests of the repetition-draw and claim-eligibility logic
@@ -620,6 +630,126 @@ signal). Those tuned values were deliberately not applied. The pipeline itself i
 reusable; a trustworthy run would need a much larger dataset (thousands of positions from deeper
 searches), which is a multi-hour undertaking not attempted in this pass.
 
+## Tier 16: real-platform corrections, plus three more strength additions
+
+Two parts, done in the same pass but logically separate: first, re-verifying this repo's own
+assumptions about the platform directly against the live contract (`AGENTS.md`'s own "fetch before
+you rely on a number" advice, finally acted on rather than just stated); second, three more
+search/eval additions picked from a prioritized list, scoped to keep each one low-risk given no
+interim testing between them (full gate + head-to-head games ran once, at the end, not after each
+item).
+
+**Live-contract re-verification.** Fetching `aichessathon.com/docs/agent-contract.md` and
+`.../rules.md` directly (rather than trusting this repo's own `AGENTS.md` quick-reference or
+`harness/rules.py`, both of which had drifted stale) confirmed three numbers moved since this repo
+was first set up: the init budget is **90s**, not the 60s `AGENTS.md`/`harness/rules.py` still say;
+the ply cap is **600**, not 300; daily uploads are **10** per team, not 6. `harness/` is
+deliberately left untouched regardless (`AGENTS.md`'s own standing rule -- it mirrors the
+platform's protocol and changing it would make local results meaningless), so `harness/rules.py`'s
+`INIT_BUDGET_S = 60.0` and `PLY_CAP = 300` stay stale on purpose; a local `harness.play`/
+`harness.arena` run will still reject an agent that takes 60-90s to init even though the real
+platform would accept it. `AGENTS.md`'s own quick-reference numbers were updated to match (a
+separate, smaller edit alongside this one), since nothing in its own text asks for it to stay
+frozen the way `harness/` explicitly does.
+
+The hardware side of the contract was also reconfirmed, explicitly this time rather than inferred:
+**one core of an AMD EPYC 9V74**, 2GB RAM. That directly exposed a real bug in Tier 15's own
+`SMP_THREADS` calculation, `max(1, min(4, os.cpu_count() or 1))`: `os.cpu_count()` reports the
+*host's* total logical CPUs, not a cgroup/quota-limited allotment -- the normal way a container
+enforces "one core" is a CPU quota, not CPU pinning, and `os.cpu_count()` does not reliably reflect
+a quota the way it would reflect pinning. On the real platform this could well have kept returning
+a number greater than 1, meaning Lazy SMP's helper threads would spawn and simply time-slice the
+one real core against the main thread -- pure contention for zero actual parallelism, exactly the
+"more threads than cores" mistake `docs/IDEAS.md` (the platform's own original guidance, not this
+repo's) calls out by name as something that "loses games for free". Fixed by hardcoding
+`SMP_THREADS = 1` in `agent.py` rather than attempting more robust runtime detection: the contract
+already states the core count outright, so there is nothing to detect, and a brittle detection
+mechanism (e.g. `os.sched_getaffinity`, itself not guaranteed to reflect a cgroup quota either) would
+only add failure modes for no benefit. Lazy SMP's machinery (search_root's `nogil=True` compile,
+`_spawn_helpers`/`_helper_worker`) stays in place, now simply spawning zero helper threads
+(`SMP_THREADS - 1 == 0`) -- a one-line flip back if a future contract version ever documents more
+than one core. Confirmed compile-cost-neutral (see the match results below): this is a runtime
+change, not a compiled-control-flow one.
+
+**TT doubled again**, 4M buckets (~160MB) -> 8M buckets (~320MB) (`search.py`, `TT_BUCKETS`). Same
+reasoning as Tier 14's own doubling -- a pure array-size constant, zero compile cost -- but no
+longer a guess about the real memory ceiling: the reconfirmed 2GB RAM makes ~320MB a known-safe
+~16% of it.
+
+**Multi-cut pruning** (`search.py`), riding on the exact verification search singular extensions
+(Tier 13) already pays for rather than running a second, separate reduced-depth search of its own:
+that search excludes the hash move and checks whether anything else can reach `singular_beta` (a
+narrow window just below the hash move's own stored score). If the hash move turns out not to be
+singular (something else reached `singular_beta`) **and** `singular_beta` is itself >= the real
+`beta`, that is evidence two independent moves at this node can each reach beta on their own (the
+hash move's own stored score, and the one the verification search just found) -- normally treated
+as strong enough to cut the whole node without searching the rest of it, the same way a null-move
+cutoff does and for the same reason. Returns `beta` itself, not the possibly-higher `singular_beta`,
+matching null-move pruning's own conservative cutoff value. A classic pairing with singular
+extensions in real engines; implementing it this way (reading an existing search's result a second
+way) rather than as a standalone reduced-depth search over the first few moves keeps this at zero
+extra search cost and a small diff, deliberately choosing not to also implement a separate ProbCut
+on top -- see "Declined" below.
+
+**Adaptive late move reductions** (`search.py`, `LMR_TABLE`): the previous flat one-ply reduction
+is replaced by the standard depth/move-index log-log formula real engines start from
+(`0.5 + log(depth) * log(move_index) / 2.25`, capped at `LMR_MAX_REDUCTION` = 4 plies), so a quiet
+move that is both very late in the ordering and very deep in the tree now gets reduced further than
+one just past the `LMR_MIN_DEPTH`/`LMR_MIN_MOVE_INDEX` thresholds, rather than the same flat one
+ply either way. `LMR_TABLE` is pure lookup data built once at import in plain Python (the same
+pattern `FUTILITY_MARGIN`/`LMP_THRESHOLD` already use), so this changes nothing about `negamax`'s
+own compiled control flow or init cost -- only the reduction magnitude, gated by the same trigger
+conditions as before.
+
+**Two new eval terms** (`evaluate.py`): `outpost_score` rewards a knight on a square an own pawn
+defends that no enemy pawn can ever capture it on (the "can ever capture it on" check reuses
+`PASSED_MASK_WHITE`/`BLACK` -- the same own-file-plus-adjacent-files-strictly-ahead shape
+`pawn_structure`'s passed-pawn check already builds -- rather than a new mask; this
+deliberately over-restricts slightly, since a same-file enemy pawn ahead cannot actually capture
+the knight but is still counted against it, the same safe-direction approximation
+`is_insufficient_material` and others in this module already accept). `space_and_storm_score`
+combines a flat bonus per own pawn advanced past the halfway line (a crude space/board-control
+proxy) with a pawn-storm bonus, scaled by how far advanced, for an own pawn on one of the three
+files around the enemy king -- both phase-faded the same way `king_safety_score` is, for the same
+reason (these are middlegame concerns; a bare-king endgame is the king PST's own territory).
+
+**Declined, with reasons specific to each, not time pressure:** a separate ProbCut -- functionally
+redundant with the multi-cut addition above, since both rest on "a reduced/narrow verification
+search predicts a real beta cutoff"; implementing both would mostly double-count the same signal
+for extra risk and extra compiled control flow. A "candidate passed pawn" eval term (a pawn not yet
+strictly passed but likely to become so) -- judged too little incremental value over the existing
+strict passed-pawn check for a second, harder-to-verify pawn-structure heuristic added in the same
+pass as everything else here.
+
+No new dedicated test file: like Tier 7 (history malus) and Tier 9 (reverse-futility/LMP), these
+are heuristic pruning and move-ordering/eval changes, not correctness changes -- multi-cut and
+adaptive LMR can, like every other pruning technique already in this engine, rarely discard a real
+line, and the two eval terms are ordinary additive scoring terms in the same style as everything
+else in `evaluate.py`. Covered by the existing full gate (`ruff`, `mypy --strict`, all 13 existing
+test files) plus head-to-head games instead.
+
+**Measured, not assumed:** full gate clean. Head-to-head against the pre-Tier-13-restore build
+(commit `c5be352`, singular extensions freshly added, none of Tiers 14-16) at 25s+0.25s blitz on
+this dev machine, generous init budget so the slower comparison build wasn't disqualified locally:
+a 2-game match (+1 =0 -1) followed by a 10-game match (+4 =4 -2, 60%) -- the first batch in this
+whole investigation where this build outscored that baseline rather than losing to it (an earlier,
+larger 8-game batch against the same baseline, run *before* any Tier 16 change, had gone the other
+way, +1 =3 -4). Small samples throughout (`docs/IDEAS.md` itself: "two games tell you nothing"), so
+this is read as "no red flags, a real positive trend," not a settled strength claim. One specific
+pattern from the earlier 8-game batch -- the engine reaching a winning endgame and shuffling into a
+threefold-repetition draw instead of converting -- recurred twice more in the 10-game batch, but
+both times traced (via the same eval-swing-over-the-PGN method used before) to positions that look
+like genuine holds: one a king-defended, uncapturable passed pawn (a real technical fortress, not a
+missed win), the other a near-equal position where the *baseline* build found the perpetual check to
+escape a slightly worse spot. Neither reproduced the earlier batch's clear case (a trivial king-and-
+pawn win shuffled away). Not proof the underlying issue is gone, just that its worst form didn't
+recur here -- worth a larger, slower-time-control sample before calling it fixed.
+
+Init time measured compile-cost-neutral for the free fixes (SMP/TT) as designed, and up modestly
+(~2-3%) for the multi-cut/adaptive-LMR search additions, consistent with what was actually changed:
+real but small extra branches in `negamax`'s own compiled control flow, not a new technique built
+from scratch the way singular extensions was.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -709,6 +839,12 @@ searches), which is a multi-hour undertaking not attempted in this pass.
   zero helper-thread exceptions (which `Thread.join()` alone would silently swallow), and confirms
   54k+ TT entries were written in a single 24-ply game -- proof the helper threads actually ran
   concurrently and shared the table, not just started and no-opped.
+- Tier 16: full gate (ruff, mypy --strict, all 13 existing test files -- no new one, see that
+  section for why) clean. `SMP_THREADS = 1` re-confirmed via `test_lazy_smp.py`'s own existing
+  "degrades to a no-op, which is correct, not a failure" note (written for exactly this case).
+  Head-to-head vs the pre-Tier-13-restore build (`c5be352`): a 2-game match (+1 =0 -1), then a
+  10-game match (+4 =4 -2, 60%) -- see that section for the full breakdown and the caveats around
+  reading a 10-game sample as a strength claim.
 - Investigated a user-reported "blundered a winning position" game at
   `r2qr2k/pp5p/8/3nPbp1/3B1P1b/1BPp4/PQ4P1/R5KR b - - 3 22` (75s on the clock). Not a bug: the
   ~2.89s budget that position gets (see the init-time and time-budget notes below) only reaches
@@ -798,6 +934,15 @@ same vein -- search-side control flow, not eval terms, per the profiling above -
 counter-move heuristic from Tier 3, not singular extensions again unless a bigger head-to-head
 sample changes this read.
 
+**Update (Tier 16): the "real 90s cap" above is now independently re-confirmed from the live
+contract itself**, not just inferred from a platform validation-log number -- see Tier 16's own
+section. The 90s figure this whole section already used turned out to be correct all along; the
+number that was actually stale was this repo's own `AGENTS.md`/`harness/rules.py`, which still say
+60s. `harness/rules.py` is deliberately left as-is regardless (never edited, `AGENTS.md`'s own
+standing rule), so a local `harness.play`/`harness.arena` run still enforces the old 60s figure --
+worth remembering if a future local run rejects a build that would actually pass on the real
+platform.
+
 ## Future
 
 See `docs/FUTURE.md` -- items 1-7 (adaptive time management, aspiration windows, null-move
@@ -839,3 +984,16 @@ instead of downloading one (item 8's blocker) -- multi-day scope, not worth it a
 remaining unless everything else is done early. A properly-sized Texel tuning run (thousands of
 positions from deeper self-play games, a multi-hour undertaking) is the other explicitly-deferred
 item, per Tier 15's own section above.
+
+A fourth round (Tier 16) started from re-verifying this repo's own platform assumptions against
+the live contract directly, which surfaced a real bug (Tier 15's `SMP_THREADS` calculation trusting
+`os.cpu_count()` on hardware the contract already documents as one core) rather than a documentation
+nit alone -- fixed by hardcoding it, per that section. From the same round's prioritized list: TT
+doubled again (now a known-safe fraction of the reconfirmed 2GB RAM, not a guess), multi-cut pruning
+(riding on Tier 13's own singular-extension verification search rather than a separate reduced
+search), adaptive depth/move-index late move reductions replacing the old flat one-ply reduction,
+and two eval terms (knight outposts, space/pawn-storm). A separate ProbCut and a "candidate passed
+pawn" eval term were both explicitly declined -- see Tier 16's own section for why each, specific to
+it rather than time pressure. Measured head-to-head against the pre-Tier-13-restore build across a
+2-game and a 10-game local match (+5 =4 -3 combined) -- the first batch in this whole investigation
+to outscore that baseline; see Tier 16's section for the sample-size caveats.

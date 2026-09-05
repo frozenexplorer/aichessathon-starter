@@ -4,17 +4,24 @@ Ranked by strength-gained-per-day-of-effort given the 2026-09-11 11:00 London de
 raw impact alone. Tier 1 (transposition table, killer/history move ordering, PVS, DTZ tablebase,
 tapered/richer evaluation) and Tier 2 (items 1-7 below) are both shipped; see `docs/STATUS.md`
 for what each covers and the current verified state, including why items 8-10 remain undone for
-reasons specific to each, not time pressure. Tiers 3-15 are further passes shipped on top of this
+reasons specific to each, not time pressure. Tiers 3-16 are further passes shipped on top of this
 list, none of them part of the original prioritization here -- see `docs/STATUS.md`'s own
-Tier 3 through Tier 15 sections for what each covers (in short: Tier 3 mobility/futility/bigger
+Tier 3 through Tier 16 sections for what each covers (in short: Tier 3 mobility/futility/bigger
 TT/IID/counter-move/delta pruning; Tier 4 endgame-specific eval; Tier 5 threat/pin/x-ray eval;
 Tier 6 a quiescence-in-check search bug fix; Tier 7 history malus; Tier 8 king safety eval;
 Tier 9 reverse-futility and late-move pruning; Tier 10 fifty-move-rule draw detection; Tier 11
 insufficient-material draw detection; Tier 12 a timeman move-overhead safety margin; Tier 13
 singular extensions; Tier 14 a TT size doubling plus a tempo bonus and opposite-bishop draw
-scaling; Tier 15 Lazy SMP multi-threaded search and a branching-factor early stop). Tier 13 was
-also trial-reverted and restored in between shipping and Tier 14 -- see `docs/STATUS.md`'s "Known
-risk: init-time margin" section for that whole round trip and why it ended back where it started.
+scaling; Tier 15 Lazy SMP multi-threaded search and a branching-factor early stop; Tier 16
+re-verifying the live contract directly -- which found Tier 15's `SMP_THREADS` trusting
+`os.cpu_count()` on hardware the contract already documents as one core, fixed by hardcoding it --
+plus another TT doubling, multi-cut pruning, adaptive late move reductions, and two eval terms
+(knight outposts, space/pawn-storm)). Tier 13 was also trial-reverted and restored in between
+shipping and Tier 14 -- see `docs/STATUS.md`'s "Known risk: init-time margin" section for that whole
+round trip and why it ended back where it started; that same section now also carries Tier 16's
+confirmation that the real init cap really is 90s, not the 60s this repo's own `AGENTS.md`/
+`harness/rules.py` still say (the latter deliberately left unedited regardless, per `AGENTS.md`'s
+own standing rule against ever changing `harness/`).
 Re-run the full gate -- `tests/perft.py`, `tests/test_repetition.py`, `tests/test_see.py`,
 `tests/test_magic_attacks.py`, `tests/test_threats.py`, `tests/test_quiescence_check.py`,
 `tests/test_king_safety.py`, `tests/test_fifty_move.py`, `tests/test_insufficient_material.py`,
