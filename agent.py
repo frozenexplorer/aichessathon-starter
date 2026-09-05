@@ -36,20 +36,6 @@ history table, and the counter-move table are cheap move-ordering aids that enco
 own cutoff history, not the position, so they are rebuilt fresh every call rather than carried
 across moves.
 
-Lazy SMP: alongside the main thread's own iterative-deepening loop below (unchanged from before,
-still the only thread whose move is ever returned), `_spawn_helpers` starts up to
-SMP_THREADS - 1 helper threads each running the same search_root against the same _tt_* arrays --
-real concurrent execution, not just interleaved, since search.py's search_root is compiled
-nogil=True (see its module docstring for why that is safe and confirmed to work on this numba
-version before relying on it here). Helper threads exist purely to enrich the shared TT while the
-main thread searches; their own return values are discarded. Each helper gets its own COPY of
-_history/_opponent_history (search.py's negamax writes further entries onto whatever history array
-it is given as it descends, so two threads sharing one array would corrupt each other's
-in-search repetition detection -- a real correctness hazard, unlike the TT's tolerable-by-design
-races) and its own fresh killer/history/counter-move tables and counters, never shared. Helpers
-target `base_deadline` (never the volatility-extended budget), so joining them after the main
-thread's own loop finishes is always a short, bounded wait, never the reason a move is late.
-
 Branching-factor early stop: before starting depth N+1, the main loop compares the time depth N
 itself took against the time actually remaining under the deadline that iteration would use --
 skip it, and return the current best immediately, if even BRANCHING_ESTIMATE times as long would
@@ -59,8 +45,19 @@ used instead; BRANCHING_ESTIMATE is deliberately conservative so this only ever 
 were very unlikely to complete anyway.
 """
 
-import threading
+import os
 import time
+
+# Numba reads its own config from the environment at import time, so this has to run before
+# anything below pulls numba in transitively (bitboard.py itself doesn't import numba, but
+# movegen.py -- imported next -- does). Measured on this dev machine (docs/plan.md "Measured
+# current state"): NUMBA_OPT=1 plus both vectorizers off cuts total init time by ~9% with no
+# effect on runtime node rate (verified via tests/bench_nodes.py before/after); NUMBA_OPT=0 was
+# tried and is worse (more compile time, not less), so this deliberately pins 1, not 0.
+# setdefault so an explicit environment override (e.g. a future harness change) still wins.
+os.environ.setdefault("NUMBA_OPT", "1")
+os.environ.setdefault("NUMBA_LOOP_VECTORIZE", "0")
+os.environ.setdefault("NUMBA_SLP_VECTORIZE", "0")
 
 import numpy as np
 
@@ -82,17 +79,6 @@ MAX_DEPTH = 64
 # ordering is usually well under this), so this only ever skips a depth that is very unlikely to
 # have completed anyway, not one with a real chance.
 BRANCHING_ESTIMATE = 4
-
-# Hardcoded, not os.cpu_count()-derived: the agent contract guarantees exactly one core, and
-# os.cpu_count() reports the host's total logical CPUs, not a cgroup/quota-limited allotment --
-# on a real container restricted to one core via quota (the normal mechanism, not CPU pinning) it
-# would very likely still report the underlying host's full core count, so trusting it here would
-# spawn helper threads that only ever time-slice the single core actually available: pure
-# contention with the main thread for zero real parallelism, precisely the "more threads than
-# cores" mistake docs/IDEAS.md calls out by name. SMP_THREADS - 1 helper threads are spawned below,
-# so this leaves Lazy SMP's machinery in place (see agent.py/search.py module docstrings) but
-# inert, a one-line flip if a future contract ever documents more than one core.
-SMP_THREADS = 1
 
 _history = np.zeros(sr.HISTORY_CAPACITY, dtype=np.uint64)
 _history_len = 0
@@ -158,9 +144,6 @@ def get_move(fen: str, time_left_ms: int) -> str:
             history_table, counter_from, counter_to, counter_promo, halfmove_clock,
         )
     else:
-        helper_threads = _spawn_helpers(
-            bb, meta, base_deadline, hist_len, _opponent_history_len, halfmove_clock
-        )
         pv_from, pv_to, pv_promo = -1, -1, -1
         prev_score: int | None = None
         prev_iteration_elapsed: float | None = None
@@ -197,8 +180,6 @@ def get_move(fen: str, time_left_ms: int) -> str:
                 break
             prev_score = score
             depth += 1
-        for helper in helper_threads:
-            helper.join()
 
     _prev_piece_count = piece_count
     best_from, best_to, best_promo = _record_and_return(bb, meta, best_from, best_to, best_promo)
@@ -226,58 +207,6 @@ def _is_volatile(
     if prev_piece_count is not None and piece_count < prev_piece_count:
         return True
     return piece_count <= timeman.LOW_PIECE_COUNT
-
-
-def _helper_worker(
-    bb: np.ndarray,
-    meta: np.ndarray,
-    deadline: float,
-    hist_len: int,
-    opponent_hist_len: int,
-    halfmove_clock: int,
-) -> None:
-    """One Lazy SMP helper thread: its own iterative-deepening loop against the shared _tt_*
-    arrays, own history copies and move-ordering tables (see this module's docstring), own return
-    value discarded -- it exists only to enrich the shared TT while the main thread's own loop
-    (unchanged, still the only source of the move actually played) runs concurrently.
-    """
-    history_copy = _history.copy()
-    opponent_history_copy = _opponent_history.copy()
-    killer_from, killer_to, killer_promo = sr.new_killers()
-    history_table = sr.new_history_table()
-    counter_from, counter_to, counter_promo = sr.new_counter_table()
-    counters = sr.new_counters()
-    depth = 1
-    while True:
-        _f, _t, _p, score, completed = sr.search_root(
-            bb, meta, depth, deadline, counters, -1, -1, -1,
-            history_copy, hist_len, opponent_history_copy, opponent_hist_len,
-            _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
-            killer_from, killer_to, killer_promo, history_table,
-            counter_from, counter_to, counter_promo, sr.NO_PREV_SCORE, halfmove_clock,
-        )
-        if not completed or abs(score) >= MATE_THRESHOLD or depth >= MAX_DEPTH:
-            break
-        depth += 1
-
-
-def _spawn_helpers(
-    bb: np.ndarray,
-    meta: np.ndarray,
-    deadline: float,
-    hist_len: int,
-    opponent_hist_len: int,
-    halfmove_clock: int,
-) -> list[threading.Thread]:
-    threads = []
-    for _ in range(SMP_THREADS - 1):
-        thread = threading.Thread(
-            target=_helper_worker,
-            args=(bb, meta, deadline, hist_len, opponent_hist_len, halfmove_clock),
-        )
-        thread.start()
-        threads.append(thread)
-    return threads
 
 
 def _record_and_return(
@@ -322,7 +251,10 @@ def _search_restricted(
         depth_best = moves[0]
         for f, t, p in moves:
             child_halfmove_clock = (
-                0 if (sr.is_capture(bb, meta, f, t) or mg.piece_type_at(bb, meta[0], f) == bbm.PAWN)
+                0 if (
+                    sr.is_capture(bb, meta, f, t)
+                    or mg.piece_type_at(bb, int(meta[0]), f) == bbm.PAWN
+                )
                 else halfmove_clock + 1
             )
             new_bb, new_meta = mg.make_move(bb, meta, f, t, p)
@@ -352,7 +284,21 @@ def _search_restricted(
 
 
 def _warm_up() -> None:
-    """Pay the numba compile cost here, inside the 60s init budget, not on the match clock."""
+    """Pay the numba compile cost here, inside the 90s init budget, not on the match clock.
+
+    search_root's own call graph already compiles negamax, quiescence, generate_legal,
+    make_move, is_capture, piece_type_at and claim_eligible_for_opponent for the array-sourced
+    argument types every real search node uses -- calling those again standalone afterward adds
+    no new compile, only wasted runtime, so this does not repeat them. The one path search_root's
+    call graph does NOT reach is _search_restricted's (agent.py's tablebase-narrowed endgame
+    search): it calls sr.is_capture, mg.piece_type_at and sr.negamax directly from Python with
+    plain ints and a bare meta[0] (int8) rather than the array-derived values above, and with
+    every njit function in this codebase now normalised to a single int64 specialisation for
+    from/to/color/square arguments (see docs/plan.md Phase 1.1), that path already lands on the
+    same compiled specialisation -- but this call stays here as the explicit, cheap assertion of
+    that fact, so a future signature drift fails loudly at import time instead of compiling from
+    scratch mid-game, on the clock (see docs/plan.md Phase 1.1(c)).
+    """
     bb, meta = bbm.from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
     counters = sr.new_counters()
     deadline = time.perf_counter() + 30.0
@@ -370,12 +316,19 @@ def _warm_up() -> None:
     )
     from_arr, to_arr, promo_arr, count = mg.generate_legal(bb, meta)
     sr.quick_best_move(bb, meta, from_arr, to_arr, promo_arr, count)
-    new_bb, new_meta = mg.make_move(bb, meta, int(from_arr[0]), int(to_arr[0]), int(promo_arr[0]))
-    sr.quiescence(
-        new_bb, new_meta, -sr.INF, sr.INF, time.perf_counter() + 5.0, counters, 4,
-        sr.QSEARCH_CHECK_BUDGET,
+
+    # _search_restricted's exact call shape: plain Python ints and a bare meta[0], never the
+    # from_arr/to_arr/promo_arr the rest of this function uses.
+    f0, t0, p0 = int(from_arr[0]), int(to_arr[0]), int(promo_arr[0])
+    sr.is_capture(bb, meta, f0, t0)
+    mg.piece_type_at(bb, int(meta[0]), f0)
+    new_bb, new_meta = mg.make_move(bb, meta, f0, t0, p0)
+    sr.negamax(
+        new_bb, new_meta, 1, -sr.INF, sr.INF, deadline, counters, 1, history, 1,
+        _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
+        killer_from, killer_to, killer_promo, history_table, True, sr.MAX_CHECK_EXTENSIONS,
+        counter_from, counter_to, counter_promo, f0, t0, 0, -1, -1,
     )
-    sr.claim_eligible_for_opponent(new_bb, new_meta, history, 1, opponent_history, 0, 1)
     tb.best_moves("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1")
 
 
