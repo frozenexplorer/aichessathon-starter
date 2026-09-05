@@ -38,6 +38,16 @@ own cover, not the enemy's actual reach toward it). Phase-blended the opposite w
 passed-pawn/king-distance terms: full strength with pieces still on the board to attack with,
 fading to zero in the endgame, where an exposed king stops being a liability and becomes an asset
 (the king PST's own phase blend already covers that side of it).
+
+Two small additions on top of all the above, both zero/near-zero compile cost since they add no
+new control flow to speak of: a flat tempo bonus (`TEMPO_BONUS`) for the side to move, added after
+every other term and after the perspective flip so it always rewards whoever's turn it is; and
+`opposite_bishops_scale`, which scales the whole eval down to `OCB_SCALE_PERCENT` percent in a pure
+opposite-coloured-bishop endgame (exactly one bishop each, opposite-coloured squares, no other
+minor or major piece for either side) -- these are famously drawish even a material edge up, since
+the bishops can never contest the same squares, so an unscaled eval overstates real winning
+chances. Deliberately scoped to bishops-and-pawns-only endgames: OCB alongside rooks or queens does
+not carry the same drawish tendency, so those are left at full weight.
 """
 
 import numpy as np
@@ -52,7 +62,7 @@ from attacks import (
     rook_attacks,
 )
 from bitboard import BISHOP, BLACK, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE
-from movegen import attacked_by, king_square, occ_color, piece_type_at
+from movegen import SQUARE_COLOR_MASK, attacked_by, king_square, occ_color, piece_type_at
 
 PIECE_VALUE = np.array([100, 320, 330, 500, 900, 0], dtype=np.int32)
 
@@ -155,6 +165,8 @@ PIN_KING_DIVISOR = np.int32(6)
 XRAY_FLAT_BONUS = np.int32(6)
 XRAY_HEAVY_DIVISOR = np.int32(10)
 KING_ZONE_ATTACK_WEIGHT = np.array([2, 20, 20, 30, 45, 0], dtype=np.int32)
+TEMPO_BONUS = np.int32(10)
+OCB_SCALE_PERCENT = np.int32(60)
 
 
 def _build_file_masks() -> np.ndarray:
@@ -617,6 +629,31 @@ def king_safety_score(bb: np.ndarray, phase: int) -> int:
 
 
 @njit(cache=False)
+def opposite_bishops_scale(bb: np.ndarray) -> int:
+    """A percentage (0-100) to scale the rest of the eval by. A pure opposite-coloured-bishop
+    endgame (exactly one bishop each, on opposite-coloured squares, with no other minor or major
+    piece for either side -- rooks/queens alongside OCB do not carry the same drawish tendency) is
+    famously drawish even a pawn or two up: the bishops can never contest the same squares, so the
+    stronger side often cannot force real progress. 100 (no scaling) otherwise.
+    """
+    if (
+        bb[WHITE * 6 + KNIGHT] or bb[BLACK * 6 + KNIGHT]
+        or bb[WHITE * 6 + ROOK] or bb[BLACK * 6 + ROOK]
+        or bb[WHITE * 6 + QUEEN] or bb[BLACK * 6 + QUEEN]
+    ):
+        return 100
+    white_bishops = bb[WHITE * 6 + BISHOP]
+    black_bishops = bb[BLACK * 6 + BISHOP]
+    if _popcount64(white_bishops) != 1 or _popcount64(black_bishops) != 1:
+        return 100
+    white_light = (white_bishops & SQUARE_COLOR_MASK) != 0
+    black_light = (black_bishops & SQUARE_COLOR_MASK) != 0
+    if white_light == black_light:
+        return 100
+    return int(OCB_SCALE_PERCENT)
+
+
+@njit(cache=False)
 def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
     phase = game_phase(bb)
     score = (
@@ -629,7 +666,9 @@ def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
         + pin_and_xray_score(bb)
         + king_safety_score(bb, phase)
     )
-    return int(score) if meta[0] == WHITE else int(-score)
+    score = score * opposite_bishops_scale(bb) // 100
+    stm_score = int(score) if meta[0] == WHITE else int(-score)
+    return stm_score + int(TEMPO_BONUS)
 
 
 def warm_up() -> None:

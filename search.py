@@ -348,9 +348,12 @@ MAX_KILLER_PLY = 128
 # recency slot, so a fresh position from the current search is never simply dropped because the
 # depth-preferred slot happens to be occupied by something deeper). TT_BUCKETS is the addressable
 # bucket count (indexed by the low bits of the Zobrist hash); the arrays below are twice that many
-# raw slots. 2M buckets * 2 slots * 20 bytes/slot (parallel arrays below) is a fixed ~80MB,
+# raw slots. 4M buckets * 2 slots * 20 bytes/slot (parallel arrays below) is a fixed ~160MB,
 # independent of game length -- no growth, no eviction bookkeeping beyond the two-slot policy.
-TT_BUCKETS = 1 << 21
+# Doubled from 2M buckets (~80MB): fewer collisions over a full game's worth of nodes at no compile
+# or init cost (a pure array-size constant, same code either way) -- kept modest rather than a
+# larger multiple since the platform's real memory ceiling isn't known.
+TT_BUCKETS = 1 << 22
 TT_SIZE = TT_BUCKETS * 2
 TT_MASK = np.uint64(TT_BUCKETS - 1)
 TT_EXACT = np.int8(0)
