@@ -31,11 +31,13 @@ def run_negamax(excluded_from: int, excluded_to: int, depth: int = 4) -> tuple[i
     tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo = sr.new_tt()
     killer_from, killer_to, killer_promo = sr.new_killers()
     history_table = sr.new_history_table()
+    cont_hist = sr.new_continuation_history()
     counter_from, counter_to, counter_promo = sr.new_counter_table()
     score = sr.negamax(
         bb, meta, depth, -sr.INF, sr.INF, deadline, counters, 0, history, 0,
         tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-        killer_from, killer_to, killer_promo, history_table, True, sr.MAX_CHECK_EXTENSIONS,
+        killer_from, killer_to, killer_promo, history_table, cont_hist, True,
+        sr.MAX_CHECK_EXTENSIONS,
         counter_from, counter_to, counter_promo, -1, -1, 0, excluded_from, excluded_to,
     )
     return score, tt_key
@@ -79,11 +81,13 @@ def main() -> None:
     tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo = sr.new_tt()
     killer_from, killer_to, killer_promo = sr.new_killers()
     history_table = sr.new_history_table()
+    cont_hist = sr.new_continuation_history()
     counter_from, counter_to, counter_promo = sr.new_counter_table()
     sr.negamax(
         bb, meta, 4, -sr.INF, sr.INF, 1e18, counters, 0, history, 0,
         tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-        killer_from, killer_to, killer_promo, history_table, True, sr.MAX_CHECK_EXTENSIONS,
+        killer_from, killer_to, killer_promo, history_table, cont_hist, True,
+        sr.MAX_CHECK_EXTENSIONS,
         counter_from, counter_to, counter_promo, -1, -1, 0, 4, 3,
     )
     root_slot_written = tt_key[slot_a] == h or tt_key[slot_b] == h

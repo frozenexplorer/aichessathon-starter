@@ -27,11 +27,13 @@ def call_negamax(halfmove_clock: int) -> int:
     tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo = sr.new_tt()
     killer_from, killer_to, killer_promo = sr.new_killers()
     history_table = sr.new_history_table()
+    cont_hist = sr.new_continuation_history()
     counter_from, counter_to, counter_promo = sr.new_counter_table()
     return sr.negamax(
         bb, meta, 0, -sr.INF, sr.INF, deadline, counters, 0, history, 0,
         tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-        killer_from, killer_to, killer_promo, history_table, True, sr.MAX_CHECK_EXTENSIONS,
+        killer_from, killer_to, killer_promo, history_table, cont_hist, True,
+        sr.MAX_CHECK_EXTENSIONS,
         counter_from, counter_to, counter_promo, -1, -1, halfmove_clock, -1, -1,
     )
 

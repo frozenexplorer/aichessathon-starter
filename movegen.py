@@ -233,7 +233,18 @@ def make_null_move(meta: np.ndarray) -> np.ndarray:
     return new_meta
 
 
-@njit(cache=False)
+# Phase 4.2 of docs/plan.md: an explicit eager signature -- not a strength change, insurance. See
+# search.py's own eager-signature block (negamax/quiescence/search_root) for the full rationale;
+# make_move is the one such function outside search.py, called from both search.py and agent.py's
+# _search_restricted with args already uniformly int64 today (Phase 1.1(b) fixed the int8/int64
+# drift that used to give this two specialisations), so this just makes that structural rather
+# than merely observed.
+_MAKE_MOVE_SIG = _nbtypes.Tuple(  # type: ignore[no-untyped-call]
+    (_nbtypes.uint64[::1], _nbtypes.int8[::1])
+)(_nbtypes.uint64[::1], _nbtypes.int8[::1], _nbtypes.int64, _nbtypes.int64, _nbtypes.int64)
+
+
+@njit(_MAKE_MOVE_SIG, cache=False)
 def make_move(
     bb: np.ndarray, meta: np.ndarray, from_sq: int, to_sq: int, promo: int
 ) -> tuple[np.ndarray, np.ndarray]:

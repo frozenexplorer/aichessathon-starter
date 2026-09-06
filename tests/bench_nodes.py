@@ -48,6 +48,7 @@ def run_fixed_time(fen: str, seconds: float) -> tuple[int, int, float]:
     opponent_history = np.zeros(sr.HISTORY_CAPACITY, dtype=np.uint64)
     killer_from, killer_to, killer_promo = sr.new_killers()
     history_table = sr.new_history_table()
+    cont_hist = sr.new_continuation_history()
     counter_from, counter_to, counter_promo = sr.new_counter_table()
 
     deadline = time.perf_counter() + seconds
@@ -62,7 +63,7 @@ def run_fixed_time(fen: str, seconds: float) -> tuple[int, int, float]:
             bb, meta, depth, deadline, counters, -1, -1, -1,
             history, 1, opponent_history, 0,
             *tt,
-            killer_from, killer_to, killer_promo, history_table,
+            killer_from, killer_to, killer_promo, history_table, cont_hist,
             counter_from, counter_to, counter_promo, prev_score, 0,
         )
         total_nodes += int(counters[0])

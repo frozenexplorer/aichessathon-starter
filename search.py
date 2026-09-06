@@ -256,6 +256,7 @@ import time
 
 import numpy as np
 from numba import njit, objmode
+from numba import types as nbtypes
 
 from attacks import KING_ATTACKS, KNIGHT_ATTACKS, PAWN_ATTACKS, bishop_attacks, rook_attacks
 from bitboard import BISHOP, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE, i64
@@ -369,9 +370,32 @@ FUTILITY_MAX_DEPTH = 3
 FUTILITY_MARGIN = np.array([0, 150, 300, 450], dtype=np.int64)
 RFP_MAX_DEPTH = 6
 RFP_MARGIN = 90
-STATIC_EVAL_MAX_DEPTH = 6  # max(RFP_MAX_DEPTH, FUTILITY_MAX_DEPTH) -- shared static-eval gate
+STATIC_EVAL_MAX_DEPTH = 6  # max(RFP_MAX_DEPTH, FUTILITY_MAX_DEPTH, RAZOR_MAX_DEPTH) -- shared gate
 LMP_MAX_DEPTH = 4
 LMP_THRESHOLD = np.array([0, 6, 10, 15, 21], dtype=np.int64)
+
+# Razoring: at a very shallow, non-check node, a static eval already trailing alpha by more than a
+# depth-scaled margin almost certainly cannot be rescued by a quiet move -- confirm with a
+# quiescence call (not a blind return, so a tactical shot the static eval missed still survives)
+# and return its score outright if that also fails to reach alpha. Index 0 is never read, same as
+# FUTILITY_MARGIN above.
+RAZOR_MAX_DEPTH = 2
+RAZOR_MARGIN = np.array([0, 300, 500], dtype=np.int64)
+
+# SEE pruning in the main search (quiescence already does this for its own captures -- see
+# DELTA_MARGIN above): at a shallow node not in check, a capture whose SEE is clearly losing by
+# more than a depth-scaled margin is skipped outright rather than searched, same rationale as
+# futility pruning for quiet moves. Never applied to the first (hash/best-ordered) move.
+SEE_PRUNE_MAX_DEPTH = 5
+SEE_PRUNE_MARGIN = 100
+
+# History-based LMR: a late, quiet move's reduction (from LMR_TABLE below) is nudged by how well
+# history/continuation-history have rated it in the past -- a move both quiets and history-hot
+# almost certainly deserves the shallower search, while one that has actively cut a lot of moves
+# below it (a strongly negative malus score) deserves an extra ply off. +-1 only, so this can never
+# push a reduction far from what the depth/move-index table alone would already give.
+LMR_HISTORY_HIGH = 2000
+LMR_HISTORY_LOW = -2000
 
 # Singular extensions: only at a node deep enough (SE_MIN_DEPTH) that the extra verification
 # search below is worth its own cost, with a hash move backed by a TT entry both deep enough
@@ -407,18 +431,67 @@ MAX_KILLER_PLY = 128
 # recency slot, so a fresh position from the current search is never simply dropped because the
 # depth-preferred slot happens to be occupied by something deeper). TT_BUCKETS is the addressable
 # bucket count (indexed by the low bits of the Zobrist hash); the arrays below are twice that many
-# raw slots. 8M buckets * 2 slots * 20 bytes/slot (parallel arrays below) is a fixed ~320MB,
+# raw slots. 16M buckets * 2 slots * 20 bytes/slot (parallel arrays below) is a fixed ~640MB,
 # independent of game length -- no growth, no eviction bookkeeping beyond the two-slot policy.
-# Doubled again from 4M buckets (~160MB): fewer collisions over a full game's worth of nodes at no
-# compile or init cost (a pure array-size constant, same code either way). The agent contract now
-# documents the real memory ceiling (2 GB), so this is a known-safe ~16% of it, not a guess.
-TT_BUCKETS = 1 << 23
+# Doubled a third time from 8M buckets (~320MB, itself already doubled twice before -- Tier 14,
+# Tier 16): Phase 4.2 of docs/plan.md -- real-platform init now has real margin (~40-50s of 90s),
+# so there is room to spend pure RAM on fewer collisions over a full game's worth of nodes, at no
+# compile or init-time cost whatsoever (a pure array-size constant, same code either way). The
+# agent contract documents a 2 GB memory ceiling, so 640MB is a known-safe ~32% of it, not a guess.
+TT_BUCKETS = 1 << 24
 TT_SIZE = TT_BUCKETS * 2
 TT_MASK = np.uint64(TT_BUCKETS - 1)
 TT_EXACT = np.int8(0)
 TT_LOWER = np.int8(1)
 TT_UPPER = np.int8(2)
 MATE_STORE_THRESHOLD = MATE - 1000
+
+# Phase 4.2 of docs/plan.md: explicit eager signatures on negamax/quiescence/search_root (and
+# make_move, in movegen.py) -- not a strength change, insurance. Phase 1.1 already normalised
+# every call site to a single consistent type per parameter (Literal[int] constants wrapped in
+# np.int64(...), int8/int64 array-index drift fixed), which is *why* bench_init.py already shows
+# exactly one specialisation per function today -- but that is an empirically observed fact about
+# today's call sites, not a structural guarantee. A signature declared here makes a second
+# specialisation impossible for numba to ever produce, so a future call site that regresses back
+# to a bare Python int or a mismatched dtype fails loudly and immediately at import time (a
+# TypingError) instead of silently compiling a second specialisation of the most expensive
+# function in the engine mid-game, on the clock -- exactly the Phase 1.1(c) hazard this guards
+# against structurally rather than by convention.
+_BB_T = nbtypes.uint64[::1]
+_META_T = nbtypes.int8[::1]
+_I64 = nbtypes.int64
+_F64 = nbtypes.float64
+_B1 = nbtypes.boolean
+_I64_1D = nbtypes.int64[::1]
+_U64_1D = nbtypes.uint64[::1]
+_I32_1D = nbtypes.int32[::1]
+_I8_1D = nbtypes.int8[::1]
+_I8_2D = nbtypes.int8[:, ::1]
+_I32_2D = nbtypes.int32[:, ::1]
+
+_QUIESCENCE_SIG = _I64(_BB_T, _META_T, _I64, _I64, _F64, _I64_1D, _I64, _I64)
+
+_NEGAMAX_SIG = _I64(
+    _BB_T, _META_T, _I64, _I64, _I64, _F64, _I64_1D, _I64,
+    _U64_1D, _I64,
+    _U64_1D, _I32_1D, _I32_1D, _I8_1D, _I8_1D, _I8_1D, _I8_1D,
+    _I8_2D, _I8_2D, _I8_2D,
+    _I32_1D, _I32_2D,
+    _B1, _I64,
+    _I8_1D, _I8_1D, _I8_1D,
+    _I64, _I64, _I64, _I64, _I64,
+)
+
+_SEARCH_ROOT_RET = nbtypes.Tuple((_I64, _I64, _I64, _I64, _B1))  # type: ignore[no-untyped-call]
+_SEARCH_ROOT_SIG = _SEARCH_ROOT_RET(
+    _BB_T, _META_T, _I64, _F64, _I64_1D, _I64, _I64, _I64,
+    _U64_1D, _I64, _U64_1D, _I64,
+    _U64_1D, _I32_1D, _I32_1D, _I8_1D, _I8_1D, _I8_1D, _I8_1D,
+    _I8_2D, _I8_2D, _I8_2D,
+    _I32_1D, _I32_2D,
+    _I8_1D, _I8_1D, _I8_1D,
+    _I64, _I64,
+)
 
 
 @njit(cache=False)
@@ -660,16 +733,19 @@ def _score_moves2(
     cm_to: int,
     cm_promo: int,
     history_table: np.ndarray,
+    cont_hist: np.ndarray,
+    prev_idx: int,
 ) -> np.ndarray:
     """Same per-move scoring as _score_moves, but a plain quiet move (base score exactly 0: not
     the hash/PV move, not a promotion, not a capture) additionally gets a killer-move bonus, or
     failing that a counter-move bonus (cm_from/cm_to/cm_promo: whatever quiet move most recently
     caused a cutoff in reply to the move that led to this node -- see negamax's counter_from/to/
-    promo table), or failing that its from/to history score -- ranked killers, then counter-move,
-    then history, all below every capture and promotion, above zero. Inlined into one function
-    (rather than calling a per-move helper in the loop, as an earlier version did) purely to keep
-    numba's compile graph smaller -- this and negamax are the two most expensive functions to JIT
-    in the whole engine.
+    promo table), or failing that its from/to history score plus a continuation-history bonus
+    keyed by (prev_idx, this move's [piece type, to-square]) when prev_idx >= 0 (see
+    new_continuation_history) -- ranked killers, then counter-move, then history+continuation, all
+    below every capture and promotion, above zero. Inlined into one function (rather than calling a
+    per-move helper in the loop, as an earlier version did) purely to keep numba's compile graph
+    smaller -- this and negamax are the two most expensive functions to JIT in the whole engine.
     """
     scores = np.empty(count, dtype=np.int64)
     for i in range(count):
@@ -687,6 +763,9 @@ def _score_moves2(
             scores[i] = 5000
         else:
             h = history_table[from_sq * 64 + to_sq]
+            if prev_idx >= 0:
+                moving_pt = piece_type_at(bb, _i64(meta[0]), from_sq)
+                h += cont_hist[prev_idx, moving_pt * 64 + to_sq]
             scores[i] = h if h < 4999 else 4999
     return scores
 
@@ -714,7 +793,7 @@ def _argmax(scores: np.ndarray, count: int) -> int:
     return idx
 
 
-@njit(cache=False)
+@njit(_QUIESCENCE_SIG, cache=False)
 def quiescence(
     bb: np.ndarray,
     meta: np.ndarray,
@@ -838,7 +917,7 @@ def _tt_resolve(
     return False, 0, alpha, beta
 
 
-@njit(cache=False)
+@njit(_NEGAMAX_SIG, cache=False)
 def negamax(
     bb: np.ndarray,
     meta: np.ndarray,
@@ -861,6 +940,7 @@ def negamax(
     killer_to: np.ndarray,
     killer_promo: np.ndarray,
     history_table: np.ndarray,
+    cont_hist: np.ndarray,
     allow_null: bool,
     ext_budget: int,
     counter_from: np.ndarray,
@@ -967,6 +1047,20 @@ def negamax(
         futile = static_eval + FUTILITY_MARGIN[depth] <= alpha
 
     if (
+        have_static_eval
+        and depth <= RAZOR_MAX_DEPTH
+        and -MATE_STORE_THRESHOLD < alpha < MATE_STORE_THRESHOLD
+        and static_eval + RAZOR_MARGIN[depth] <= alpha
+    ):
+        razor_score = quiescence(
+            bb, meta, alpha, beta, deadline, counters, QUIESCENCE_MAX_PLIES, QSEARCH_CHECK_BUDGET
+        )
+        if counters[1]:
+            return 0
+        if razor_score <= alpha:
+            return razor_score
+
+    if (
         allow_null
         and depth >= NULL_MOVE_MIN_DEPTH
         and -MATE_STORE_THRESHOLD < beta < MATE_STORE_THRESHOLD
@@ -978,7 +1072,7 @@ def negamax(
             bb, null_meta, depth - 1 - NULL_MOVE_REDUCTION, -beta, -beta + 1, deadline, counters,
             ply + 1, history, child_hist_len,
             tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-            killer_from, killer_to, killer_promo, history_table, False, ext_budget,
+            killer_from, killer_to, killer_promo, history_table, cont_hist, False, ext_budget,
             counter_from, counter_to, counter_promo, -1, -1, halfmove_clock + 1, -1, -1,
         )
         if counters[1]:
@@ -995,7 +1089,7 @@ def negamax(
         negamax(
             bb, meta, depth - IID_REDUCTION, alpha, beta, deadline, counters, ply, history,
             hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-            killer_from, killer_to, killer_promo, history_table, allow_null, ext_budget,
+            killer_from, killer_to, killer_promo, history_table, cont_hist, allow_null, ext_budget,
             counter_from, counter_to, counter_promo, parent_from, parent_to, halfmove_clock,
             -1, -1,
         )
@@ -1030,7 +1124,7 @@ def negamax(
             bb, meta, (depth - 1) // 2, singular_beta - 1, singular_beta, deadline, counters,
             ply, history, hist_len,
             tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-            killer_from, killer_to, killer_promo, history_table, False, ext_budget,
+            killer_from, killer_to, killer_promo, history_table, cont_hist, False, ext_budget,
             counter_from, counter_to, counter_promo, parent_from, parent_to, halfmove_clock,
             hint_from, hint_to,
         )
@@ -1063,12 +1157,16 @@ def negamax(
         )
     else:
         cm_from, cm_to, cm_promo = -1, -1, -1
+    prev_idx = -1
+    if parent_from >= 0:
+        prev_pt = piece_type_at(bb, 1 - _i64(meta[0]), parent_to)
+        prev_idx = prev_pt * 64 + parent_to
     scores = _score_moves2(
         bb, meta, from_arr, to_arr, promo_arr, count,
         hint_from, hint_to, hint_promo,
         k1_from, k1_to, k1_promo, k2_from, k2_to, k2_promo,
         cm_from, cm_to, cm_promo,
-        history_table,
+        history_table, cont_hist, prev_idx,
     )
     best = -INF
     best_idx = -1
@@ -1115,7 +1213,8 @@ def negamax(
                 new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters,
                 ply + 1, history, child_hist_len,
                 tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
+                killer_from, killer_to, killer_promo, history_table, cont_hist, True,
+                child_ext_budget,
                 counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
             )
         else:
@@ -1127,6 +1226,18 @@ def negamax(
             # for either prune, fall through to the real make_move + is_check below exactly as
             # before -- this only ever changes the cost of a move that ends up skipped, never the
             # accuracy of one that gets searched.
+            if (
+                is_cap
+                and not in_check
+                and depth <= SEE_PRUNE_MAX_DEPTH
+                and see(bb, meta, f, t, p) < -SEE_PRUNE_MARGIN * depth
+            ):
+                # SEE pruning: this capture loses material by more than a depth-scaled margin --
+                # quiescence already prunes exactly this shape of move at its own leaves (see
+                # DELTA_MARGIN), this just applies the same reasoning one ply higher, in the main
+                # search, where such a capture would otherwise be fully searched.
+                continue
+
             if p < 0 and not in_check and not is_cap:
                 gives_check_direct = _gives_check_direct(bb, meta, f, t, p, moving_pt)
                 if not gives_check_direct:
@@ -1167,12 +1278,20 @@ def negamax(
                 d_idx = depth if depth < LMR_TABLE_MAX_DEPTH else LMR_TABLE_MAX_DEPTH
                 m_idx = oi if oi < LMR_TABLE_MAX_MOVE_INDEX else LMR_TABLE_MAX_MOVE_INDEX
                 reduction = int(LMR_TABLE[d_idx, m_idx])
+                h_score = history_table[f * 64 + t]
+                if prev_idx >= 0:
+                    h_score += cont_hist[prev_idx, moving_pt * 64 + t]
+                if h_score >= LMR_HISTORY_HIGH:
+                    reduction = max(0, reduction - 1)
+                elif h_score <= LMR_HISTORY_LOW:
+                    reduction += 1
 
             score = -negamax(
                 new_bb, new_meta, child_depth - reduction, -alpha - 1, -alpha, deadline, counters,
                 ply + 1, history, child_hist_len,
                 tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
+                killer_from, killer_to, killer_promo, history_table, cont_hist, True,
+                child_ext_budget,
                 counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
             )
             if not counters[1] and reduction > 0 and score > alpha:
@@ -1183,7 +1302,8 @@ def negamax(
                     new_bb, new_meta, child_depth, -alpha - 1, -alpha, deadline, counters,
                     ply + 1, history, child_hist_len,
                     tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                    killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
+                    killer_from, killer_to, killer_promo, history_table, cont_hist, True,
+                    child_ext_budget,
                     counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
                 )
             if not counters[1] and alpha < score < beta:
@@ -1191,7 +1311,8 @@ def negamax(
                     new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters,
                     ply + 1, history, child_hist_len,
                     tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                    killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
+                    killer_from, killer_to, killer_promo, history_table, cont_hist, True,
+                    child_ext_budget,
                     counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
                 )
         if counters[1]:
@@ -1210,6 +1331,8 @@ def negamax(
                     )
                     killer_from[ply, 0], killer_to[ply, 0], killer_promo[ply, 0] = f, t, p
                 history_table[f * 64 + t] += bonus
+                if prev_idx >= 0:
+                    cont_hist[prev_idx, moving_pt * 64 + t] += bonus
                 if parent_from >= 0:
                     cm_idx = parent_from * 64 + parent_to
                     counter_from[cm_idx] = np.int8(f)
@@ -1220,7 +1343,8 @@ def negamax(
                 # actual cutoff move is rewarded by -- not just "not rewarded", actively pushed
                 # below untried (history == 0) moves next time. Sharpens ordering everywhere,
                 # which matters most in exactly the sharp, many-candidate tactical positions this
-                # tier exists for.
+                # tier exists for. cont_hist gets the same treatment, keyed by each malus move's
+                # own [piece type, to-square] rather than the cutoff move's.
                 for oi2 in range(oi):
                     idx2 = picked_idx[oi2]
                     f2 = _i64(from_arr[idx2])
@@ -1228,6 +1352,9 @@ def negamax(
                     p2 = _i64(promo_arr[idx2])
                     if p2 < 0 and not move_is_cap[oi2]:
                         history_table[f2 * 64 + t2] -= bonus
+                        if prev_idx >= 0:
+                            pt2 = piece_type_at(bb, _i64(meta[0]), f2)
+                            cont_hist[prev_idx, pt2 * 64 + t2] -= bonus
             break
 
     # Two-tier replacement: prefer the depth-preferred slot on a same-key refresh, an empty slot
@@ -1359,6 +1486,7 @@ def _search_root_pass(
     killer_to: np.ndarray,
     killer_promo: np.ndarray,
     history_table: np.ndarray,
+    cont_hist: np.ndarray,
     counter_from: np.ndarray,
     counter_to: np.ndarray,
     counter_promo: np.ndarray,
@@ -1394,21 +1522,24 @@ def _search_root_pass(
             score = -negamax(
                 new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters, 1, history,
                 hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
+                killer_from, killer_to, killer_promo, history_table, cont_hist, True,
+                child_ext_budget,
                 counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
             )
         else:
             score = -negamax(
                 new_bb, new_meta, child_depth, -alpha - 1, -alpha, deadline, counters, 1, history,
                 hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
+                killer_from, killer_to, killer_promo, history_table, cont_hist, True,
+                child_ext_budget,
                 counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
             )
             if not counters[1] and alpha < score < beta:
                 score = -negamax(
                     new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters, 1, history,
                     hist_len, tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-                    killer_from, killer_to, killer_promo, history_table, True, child_ext_budget,
+                    killer_from, killer_to, killer_promo, history_table, cont_hist, True,
+                    child_ext_budget,
                     counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
                 )
         if counters[1]:
@@ -1427,7 +1558,7 @@ def _search_root_pass(
     return best_from, best_to, best_promo, best_score, True
 
 
-@njit(cache=False)
+@njit(_SEARCH_ROOT_SIG, cache=False)
 def search_root(
     bb: np.ndarray,
     meta: np.ndarray,
@@ -1452,6 +1583,7 @@ def search_root(
     killer_to: np.ndarray,
     killer_promo: np.ndarray,
     history_table: np.ndarray,
+    cont_hist: np.ndarray,
     counter_from: np.ndarray,
     counter_to: np.ndarray,
     counter_promo: np.ndarray,
@@ -1491,17 +1623,25 @@ def search_root(
             bb, meta, depth, alpha, beta, deadline, counters,
             history, hist_len, opponent_history, opponent_hist_len,
             tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
-            killer_from, killer_to, killer_promo, history_table,
+            killer_from, killer_to, killer_promo, history_table, cont_hist,
             counter_from, counter_to, counter_promo,
             from_arr, to_arr, promo_arr, order, count, halfmove_clock,
         )
         if not completed:
             return best_from, best_to, best_promo, best_score, False
-        if (best_score <= alpha and alpha > -INF) or (best_score >= beta and beta < INF):
+        fail_low = best_score <= alpha and alpha > -INF
+        fail_high = best_score >= beta and beta < INF
+        if fail_low or fail_high:
             window_idx += 1
             if window_idx < len(ASPIRATION_WINDOWS):
-                alpha = max(-INF, prev_score - ASPIRATION_WINDOWS[window_idx])
-                beta = min(INF, prev_score + ASPIRATION_WINDOWS[window_idx])
+                # Widen only the side that actually failed -- Phase 4.2 of docs/plan.md: the other
+                # side already bounded the real score on this pass, so keeping it tight instead of
+                # re-centering both bounds on prev_score avoids re-searching a window this pass
+                # already proved is wide enough on that side.
+                if fail_low:
+                    alpha = max(-INF, prev_score - ASPIRATION_WINDOWS[window_idx])
+                else:
+                    beta = min(INF, prev_score + ASPIRATION_WINDOWS[window_idx])
             else:
                 alpha, beta = -INF, INF
             continue
@@ -1545,8 +1685,9 @@ def new_tt() -> tuple[
     empty slot: a real entry's stored depth is always >= 1 (negamax only ever reaches the store
     site with depth >= 1, the depth <= 0 case having already returned via quiescence), which lets
     every array here be zero-initialised (a lazy calloc) instead of eagerly written by np.full --
-    ~117 MB less RSS at TT_BUCKETS' current size, no behaviour change (key is separately checked
-    for a match anyway, and every stored-depth read subtracts 1 back off -- see negamax).
+    proportionally less RSS at whatever TT_BUCKETS currently is, no behaviour change (key is
+    separately checked for a match anyway, and every stored-depth read subtracts 1 back off --
+    see negamax).
     """
     key = np.zeros(TT_SIZE, dtype=np.uint64)
     depth = np.zeros(TT_SIZE, dtype=np.int32)
@@ -1567,6 +1708,23 @@ def new_killers() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def new_history_table() -> np.ndarray:
     return np.zeros(64 * 64, dtype=np.int32)
+
+
+# Phase 4.2 of docs/plan.md: continuation history. history_table's from/to score and the
+# counter-move table (below) both only look at the CURRENT move in isolation (from/to) or at the
+# single most recent cutoff reply to a given parent move; continuation history instead accumulates
+# a graduated score for (parent move's [piece type, to-square], this move's [piece type,
+# to-square]), so a quiet move that has repeatedly worked well as a *reply to this specific kind of
+# parent move* outranks one that merely has a good from/to score in general. Indexed by piece type
+# (not from-square) for the parent half since what matters is what piece just arrived on
+# parent_to, not where it came from. Folded into history_table's own quiet-move fallback score in
+# _score_moves2 (added, not compared against), same "one extra signal, not a replacement" posture
+# _score_moves2's counter-move/killer bands already take relative to history_table.
+CONT_HIST_SIZE = 6 * 64
+
+
+def new_continuation_history() -> np.ndarray:
+    return np.zeros((CONT_HIST_SIZE, CONT_HIST_SIZE), dtype=np.int32)
 
 
 def new_counter_table() -> tuple[np.ndarray, np.ndarray, np.ndarray]:

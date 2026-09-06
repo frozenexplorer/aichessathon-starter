@@ -136,6 +136,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     hist_len = _history_len + 1
     killer_from, killer_to, killer_promo = sr.new_killers()
     history_table = sr.new_history_table()
+    cont_hist = sr.new_continuation_history()
     counter_from, counter_to, counter_promo = sr.new_counter_table()
     piece_count = tb.piece_count(bb)
     halfmove_clock = bbm.halfmove_clock(fen)
@@ -143,15 +144,19 @@ def get_move(fen: str, time_left_ms: int) -> str:
     if allowed:
         best_from, best_to, best_promo = _search_restricted(
             bb, meta, allowed, max_deadline, hist_len, killer_from, killer_to, killer_promo,
-            history_table, counter_from, counter_to, counter_promo, halfmove_clock,
+            history_table, cont_hist, counter_from, counter_to, counter_promo, halfmove_clock,
         )
     else:
         pv_from, pv_to, pv_promo = -1, -1, -1
         prev_score: int | None = None
         prev_iteration_elapsed: float | None = None
+        prev_best_move: tuple[int, int, int] | None = None
+        best_move_changed = False
         depth = 1
         while True:
-            volatile = _is_volatile(bb, meta, prev_score, None, piece_count, _prev_piece_count)
+            volatile = _is_volatile(
+                bb, meta, prev_score, None, piece_count, _prev_piece_count, best_move_changed
+            )
             deadline = max_deadline if volatile else base_deadline
             if prev_iteration_elapsed is not None:
                 remaining = deadline - time.perf_counter()
@@ -164,7 +169,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
                 bb, meta, depth, deadline, counters, pv_from, pv_to, pv_promo,
                 _history, hist_len, _opponent_history, _opponent_history_len,
                 _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
-                killer_from, killer_to, killer_promo, history_table,
+                killer_from, killer_to, killer_promo, history_table, cont_hist,
                 counter_from, counter_to, counter_promo, window_seed, halfmove_clock,
             )
             prev_iteration_elapsed = time.perf_counter() - iteration_start
@@ -172,9 +177,11 @@ def get_move(fen: str, time_left_ms: int) -> str:
                 best_from, best_to, best_promo = int(f), int(t), int(p)
             if not completed:
                 break
+            best_move_changed = prev_best_move is not None and prev_best_move != (f, t, p)
+            prev_best_move = (f, t, p)
             pv_from, pv_to, pv_promo = f, t, p
             still_volatile = _is_volatile(
-                bb, meta, prev_score, score, piece_count, _prev_piece_count
+                bb, meta, prev_score, score, piece_count, _prev_piece_count, best_move_changed
             )
             next_deadline = max_deadline if still_volatile else base_deadline
             over_time = time.perf_counter() >= next_deadline
@@ -195,12 +202,20 @@ def _is_volatile(
     score: int | None,
     piece_count: int,
     prev_piece_count: int | None,
+    best_move_changed: bool,
 ) -> bool:
     """Whether the position looks sharp enough to deserve more than the base time budget -- see
     docs/FUTURE.md item 1: a score swing between the last two completed iterative-deepening
     depths, a position not in a quiet state (in check, a capture just landed us here), or few
-    enough pieces left that precise endgame play matters.
+    enough pieces left that precise endgame play matters. best_move_changed (the root's chosen
+    move differed between the last two completed depths) is an equally strong signal real engines
+    use -- a best move that just changed at the last depth deserves the room to confirm itself at
+    the next one too; a best move that has stayed put needs no extra help from this check alone
+    (the other signals above still apply on their own merits either way, so a stable move in a
+    genuinely sharp or low-material position still gets the extended budget it needs).
     """
+    if best_move_changed:
+        return True
     swing = None if prev_score is None or score is None else abs(score - prev_score)
     if swing is not None and swing >= timeman.SCORE_SWING_CP:
         return True
@@ -236,6 +251,7 @@ def _search_restricted(
     killer_to: np.ndarray,
     killer_promo: np.ndarray,
     history_table: np.ndarray,
+    cont_hist: np.ndarray,
     counter_from: np.ndarray,
     counter_to: np.ndarray,
     counter_promo: np.ndarray,
@@ -263,7 +279,8 @@ def _search_restricted(
             score = -sr.negamax(
                 new_bb, new_meta, depth - 1, -sr.INF, sr.INF, deadline, counters, 1, _history,
                 hist_len, _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
-                killer_from, killer_to, killer_promo, history_table, True, sr.MAX_CHECK_EXTENSIONS,
+                killer_from, killer_to, killer_promo, history_table, cont_hist, True,
+                sr.MAX_CHECK_EXTENSIONS,
                 counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
             )
             if counters[1]:
@@ -309,11 +326,12 @@ def _warm_up() -> None:
     opponent_history = np.zeros(sr.HISTORY_CAPACITY, dtype=np.uint64)
     killer_from, killer_to, killer_promo = sr.new_killers()
     history_table = sr.new_history_table()
+    cont_hist = sr.new_continuation_history()
     counter_from, counter_to, counter_promo = sr.new_counter_table()
     sr.search_root(
         bb, meta, 2, deadline, counters, -1, -1, -1, history, 1, opponent_history, 0,
         _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
-        killer_from, killer_to, killer_promo, history_table,
+        killer_from, killer_to, killer_promo, history_table, cont_hist,
         counter_from, counter_to, counter_promo, sr.NO_PREV_SCORE, 0,
     )
     from_arr, to_arr, promo_arr, count = mg.generate_legal(bb, meta)
@@ -328,7 +346,8 @@ def _warm_up() -> None:
     sr.negamax(
         new_bb, new_meta, 1, -sr.INF, sr.INF, deadline, counters, 1, history, 1,
         _tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo,
-        killer_from, killer_to, killer_promo, history_table, True, sr.MAX_CHECK_EXTENSIONS,
+        killer_from, killer_to, killer_promo, history_table, cont_hist, True,
+        sr.MAX_CHECK_EXTENSIONS,
         counter_from, counter_to, counter_promo, f0, t0, 0, -1, -1,
     )
     tb.best_moves("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1")
