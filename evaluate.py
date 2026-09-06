@@ -205,12 +205,28 @@ PIN_KING_DIVISOR = np.int32(6)
 XRAY_FLAT_BONUS = np.int32(6)
 XRAY_HEAVY_DIVISOR = np.int32(10)
 KING_ZONE_ATTACK_WEIGHT = np.array([2, 20, 20, 30, 45, 0], dtype=np.int32)
+# Danger from simultaneous attackers is superlinear, not additive: a single piece bearing on the
+# ring is usually parried for free (the defender has a spare tempo), but two or more attacking at
+# once is disproportionately harder to meet since a reply to one often walks into the other. This
+# is the standard king-safety attacker-count table (see e.g. the chess programming wiki's "King
+# Safety" article) -- indexed by the number of distinct non-pawn enemy pieces with at least one
+# hit on the ring, capped at the last entry. 0-1 attackers round the raw per-square danger down to
+# nothing; each additional attacker climbs toward the raw (100%) danger.
+KING_ATTACK_COUNT_PERCENT = np.array([0, 0, 50, 75, 88, 94, 97, 99, 100], dtype=np.int32)
 TEMPO_BONUS = np.int32(10)
 OCB_SCALE_PERCENT = np.int32(60)
 OUTPOST_BONUS = np.int32(20)
 SPACE_BONUS = np.int32(4)
 STORM_BONUS = np.int32(6)
 STORM_MIN_RANK = 4  # 0-indexed rank; 4 == the 5th rank from that side's own back rank
+# The classical "rule of the square": a passed pawn the defending king cannot enter the square of
+# (accounting for a one-tempo head start when the defender is the side to move) will queen against
+# bare-king defense no matter how deep search looks, so it is priced close to won/lost outright
+# rather than left to the much smaller king-distance nudge below. Restricted to defenders with no
+# rook or queen left (see unstoppable_passed_pawn_score) -- a rook or queen can nearly always stop
+# a pawn regardless of king position, so the classical square rule does not apply once one is on
+# the board, and this term would otherwise overvalue a pawn that is trivially stoppable.
+UNSTOPPABLE_PASSER_BONUS = np.int32(500)
 
 
 def _build_file_masks() -> np.ndarray:
@@ -381,6 +397,56 @@ def passed_pawn_king_distance(bb: np.ndarray, phase: int) -> int:
             promo = f
             diff = _chebyshev(wk, promo) - _chebyshev(bk, promo)
             score -= KING_DISTANCE_WEIGHT * diff * endgame_weight // PHASE_MAX
+    return int(score)
+
+
+@njit(cache=False)
+def unstoppable_passed_pawn_score(bb: np.ndarray, phase: int, turn: int) -> int:
+    """See UNSTOPPABLE_PASSER_BONUS above: for each passed pawn whose defender has no rook or
+    queen left, checks the classical rule of the square (defending king's Chebyshev distance to
+    the promotion square vs. the pawn's own distance there, with a one-square discount for the
+    defender when it is their move to account for the tempo) and prices it as effectively decisive
+    the moment the king cannot make the square -- not a small nudge like passed_pawn_king_distance,
+    since no amount of search depth changes a bare king's inability to catch a pawn it cannot
+    reach in time.
+    """
+    endgame_weight = PHASE_MAX - phase
+    if endgame_weight == 0:
+        return 0
+    score = np.int32(0)
+    white_pawns = bb[WHITE * 6 + PAWN]
+    black_pawns = bb[BLACK * 6 + PAWN]
+
+    if not (bb[BLACK * 6 + ROOK] or bb[BLACK * 6 + QUEEN]):
+        bk = king_square(bb, BLACK)
+        remaining = white_pawns
+        while remaining:
+            sq = _bit_scan(remaining)
+            remaining &= remaining - ONE
+            if black_pawns & PASSED_MASK_WHITE[sq] == 0:
+                f, rank = sq % 8, sq // 8
+                pawn_dist = 7 - rank
+                king_dist = _chebyshev(bk, 56 + f)
+                if turn == BLACK:
+                    king_dist -= 1
+                if king_dist > pawn_dist:
+                    score += UNSTOPPABLE_PASSER_BONUS * endgame_weight // PHASE_MAX
+
+    if not (bb[WHITE * 6 + ROOK] or bb[WHITE * 6 + QUEEN]):
+        wk = king_square(bb, WHITE)
+        remaining = black_pawns
+        while remaining:
+            sq = _bit_scan(remaining)
+            remaining &= remaining - ONE
+            if white_pawns & PASSED_MASK_BLACK[sq] == 0:
+                f, rank = sq % 8, sq // 8
+                pawn_dist = rank
+                king_dist = _chebyshev(wk, f)
+                if turn == WHITE:
+                    king_dist -= 1
+                if king_dist > pawn_dist:
+                    score -= UNSTOPPABLE_PASSER_BONUS * endgame_weight // PHASE_MAX
+
     return int(score)
 
 
@@ -648,10 +714,13 @@ def king_safety_score(bb: np.ndarray, phase: int) -> int:
     """Attacker-weighted pressure on each king's own ring (KING_ATTACKS[king_sq], its up-to-eight
     adjacent squares): for each enemy piece, how many of those squares it currently attacks,
     weighted per piece type (a queen's reach into the ring is far more dangerous than a knight's).
-    Phase-blended like the king PST -- full strength with material still on the board to attack
-    with, zero once phase hits 0. King itself excluded as an attacker (kings do not approach the
-    enemy king in the phases this term is active for) and as a target weight (KING_ZONE_ATTACK_
-    WEIGHT[KING] == 0, since only the opponent's non-king pieces threatening the ring matter here).
+    The raw per-square sum is then scaled by KING_ATTACK_COUNT_PERCENT, indexed by how many
+    distinct non-pawn pieces are attacking at all -- see that table's comment for why this needs to
+    be superlinear rather than a flat sum. Phase-blended like the king PST -- full strength with
+    material still on the board to attack with, zero once phase hits 0. King itself excluded as an
+    attacker (kings do not approach the enemy king in the phases this term is active for) and as a
+    target weight (KING_ZONE_ATTACK_WEIGHT[KING] == 0, since only the opponent's non-king pieces
+    threatening the ring matter here).
     """
     if phase == 0:
         return 0
@@ -659,12 +728,14 @@ def king_safety_score(bb: np.ndarray, phase: int) -> int:
     white_occ = occ_color(bb, WHITE)
     black_occ = occ_color(bb, BLACK)
     all_occ = white_occ | black_occ
+    count_cap = len(KING_ATTACK_COUNT_PERCENT) - 1
 
     for color in range(2):
         sign = np.int32(1) if color == WHITE else np.int32(-1)
         enemy = 1 - color
         zone = KING_ATTACKS[king_square(bb, enemy)]
         danger = np.int32(0)
+        attacker_count = 0
 
         remaining = bb[color * 6 + PAWN]
         while remaining:
@@ -688,7 +759,11 @@ def king_safety_score(bb: np.ndarray, phase: int) -> int:
                     atk = queen_attacks(sq, all_occ)
                 hits = _popcount64(atk & zone)
                 danger += KING_ZONE_ATTACK_WEIGHT[pt] * np.int32(hits)
+                if hits:
+                    attacker_count += 1
 
+        percent = KING_ATTACK_COUNT_PERCENT[min(attacker_count, count_cap)]
+        danger = danger * percent // np.int32(100)
         score += sign * (danger * np.int32(phase) // np.int32(PHASE_MAX))
 
     return int(score)
@@ -818,12 +893,14 @@ def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
         )
 
     phase = game_phase(bb)
+    turn = int(meta[0])
     score = (
         material_and_pst(bb, phase)
         + pawn_structure(bb, phase)
         + piece_features(bb, phase)
         + mobility_score(bb)
         + passed_pawn_king_distance(bb, phase)
+        + unstoppable_passed_pawn_score(bb, phase, turn)
         + threats_score(bb)
         + pin_and_xray_score(bb)
         + king_safety_score(bb, phase)
