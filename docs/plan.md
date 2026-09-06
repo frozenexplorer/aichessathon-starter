@@ -371,6 +371,92 @@ six days out — and Phases 1 and 2 must be shippable without it.
 
 ---
 
+## Phase 3 result (for the record)
+
+Ran, on real self-play data, not a toy: Stage A (`768 → 512 → 32 → 1`), trained on 57,045 positions
+from 500 self-play games (checkpointed every 10 games after an earlier run lost 294 games of
+progress to an unrelated machine restart — the generator writes incrementally now), labelled with
+a fixed-depth (depth 4) `search.negamax` score, called standalone the same way
+`tests/test_singular_extension.py` already does (fresh killers/history/counter tables per position,
+one shared `new_tt()` across the run). MSE went 0.290 → 0.072 over 200 epochs of training — real
+learning, not noise. Wired behind exactly the flag 3.4 called for (`evaluate.USE_NNUE`, an env var,
+off by default, confirmed via `bench_init.py` to cost zero extra compile time when off since numba's
+own dead-branch pruning drops the unreached arm — `extract_features`/`nnue_forward` show **0**
+specialisations in the default build).
+
+**Result: lost 0-5 to the handcrafted eval in a real-contract arena** (`tools/head_to_head.py`,
+120000 ms + 500 ms, alternating colours, stopped early — a 5-0 shutout at real time control is
+decisive enough not to need the rest of a 20-game budget). Per 3.4's own gate, **it does not ship.**
+Read as a *label-quality* problem, not a data-quantity one: depth-4 `negamax` is shallow, and a net
+can never exceed what labelled it. More self-play games at the same depth would likely just be more
+of the same signal, not better signal — the lever that matters is deeper labels, which is slower per
+position, not more positions at the same depth. Stage B (3.1) was never attempted; Stage A alone
+already needed more runway than was available before the deadline.
+
+---
+
+## Phase 4 — what the freed-up margin is actually worth spending on
+
+Two numbers changed since this plan was written: real-platform init is now **~40-50 s against the
+90 s budget** (Phase 1 landed with real margin, not just enough to scrape by), and the zip is at
+**~4.6 MB of 50 MB** (`submission.zip`: 4,595,151 B unzipped). Both budgets have real headroom now.
+The temptation is to spend them because they're there — resist that and rank by expected payoff per
+hour of runway left, not by which budget looks emptiest.
+
+### 4.1 Texel-tune the existing eval *(top pick)*
+
+The self-play + position-extraction pipeline built for Phase 3 (`tools/nnue_selfplay_fast.py`,
+checkpointing, in-process bulk generation) is reusable for something with much better odds: tuning
+the **existing** handcrafted eval's constants — PST values, mobility weights, threat/pin/king-safety
+bonuses, `ROOK_OPEN_BONUS` and friends in `evaluate.py` — via logistic regression against real game
+outcomes (classic Texel tuning), not training a new architecture from nothing. `docs/STATUS.md`
+already flags some of these constants as hand-picked with visible overfitting symptoms (a source
+comment on `ROOK_OPEN_BONUS` notes it was tuned *below* `ROOK_SEMI_OPEN_BONUS`, backwards from what
+the term is meant to reward). Tens of parameters via regression is a fundamentally easier problem
+than the ~400K-parameter net Phase 3 just lost with, and it improves code already proven to work
+instead of competing against it. Costs no init time (pure offline tuning) and no zip space (same
+constants, better values). Given Phase 3's result, this is the highest-probability way to convert
+the data-generation investment already made into real Elo before the deadline.
+
+### 4.2 Spend the init-time margin (~40-50 s of runway) on search-side additions
+
+- **Continuation history** — a second move-ordering signal indexed by (piece type, to-square)
+  across the last 1-2 plies, not just the from/to counter-move table Tier 3 already has. A proven
+  Elo source in real engines, pure move-ordering, no correctness risk to verify beyond the existing
+  differential-test pattern.
+- **Internal Iterative Deepening** for nodes with no TT hash move — `docs/STATUS.md`'s own "Known
+  risk" section already names this (alongside the counter-move heuristic, which is done) as the
+  next candidate if init margin opened up again. It has.
+- **Double the TT again** — `search.py:415` `TT_BUCKETS = 1 << 23` (~320 MB) → `1 << 24` (~640 MB).
+  Zero init cost, pure RAM, and this exact move has been made twice already (Tier 14, Tier 16) with
+  measured-neutral cost both times. Diminishing returns this far up, but cheap to check.
+- **Eager numba signatures** on `negamax`/`quiescence`/`search_root`/`make_move` (mentioned, never
+  done, in 1.1). Not strength — insurance. Makes the exact duplicate-specialisation regression that
+  cost Tier 16 its margin structurally impossible instead of merely absent, and there is now enough
+  spare margin to afford being defensive about it.
+
+### 4.3 Spend the zip-space margin (~45 MB free)
+
+- **A small opening book.** A few hundred KB to low single-digit MB of known theory for the first
+  6-10 plies removes early-game risk entirely and costs nothing at runtime — a flat lookup, same
+  shape as `weights/attacks.npz`. Not explicitly addressed by `AGENTS.md:61-64` (the ban is on
+  shipping/running another *engine*; static opening data is the same category Syzygy tables and
+  NNUE weights already occupy), but check the live rules page before investing time in it, the same
+  "fetch before you rely on a number" instinct that caught the stale 60 s init figure earlier.
+- **NNUE, retried with deeper labels, if there is runway left.** The 0-5 result points at label
+  depth as the bottleneck, not sample count — a retry would mean depth 6+ labels at fewer games, not
+  depth 4 at more of them. Highest cost, least certain payoff of anything on this list this close to
+  the deadline; do 4.1 first.
+- **5-man Syzygy — deprioritised, not just declined again.** The full 5-man set is ~950 MB, nowhere
+  near the 50 MB cap regardless of how much margin exists; only a hand-picked subset of endings
+  could ever fit, which is a lot of curation for endgames that rarely come up. Lower expected payoff
+  than 4.1 or 4.2 for the effort.
+
+**If only one thing gets done from this phase: 4.1.** It is the best risk-adjusted use of both the
+time remaining and the data-generation work already sunk into Phase 3.
+
+---
+
 ## What gets removed (summary)
 
 | Item | Where | Why |
@@ -424,7 +510,10 @@ docs treating `mypy --strict` as gating them; and `.github/workflows/ci.yml` nev
 5. **Ship.** A build that passes `make gate` and clears the budget with margin is worth more than a
    stronger build that fails validation.
 6. **Phase 2** — one item at a time, benched.
-7. **Phase 3** — NNUE, flagged, shipped only on arena evidence.
+7. **Phase 3** — NNUE, flagged, shipped only on arena evidence. **Done: ran, lost 0-5, did not
+   ship** — see "Phase 3 result" above.
+8. **Phase 4** — rank by expected payoff on the margin actually available now, not by which budget
+   looks emptiest. Texel-tuning (4.1) first.
 
 Also worth doing once Phase 1 lands: update `docs/STATUS.md` with the real per-function compile
 numbers, since the current entry (`STATUS.md:880-885`) attributes the cost to function size alone and
