@@ -64,6 +64,8 @@ justify a second, harder-to-verify pawn-structure heuristic in the same pass as 
 here.
 """
 
+import os
+
 import numpy as np
 from numba import njit
 
@@ -85,6 +87,22 @@ from movegen import (
     occ_color,
     piece_type_at,
 )
+from nnue import extract_features, load_weights, nnue_forward, zero_weights
+
+# Phase 3 (docs/plan.md) -- the trained-NNUE flag. Off by default: this branch must never change
+# what ships or how the real build behaves unless a real arena run (3.4) says the net actually
+# wins. `USE_NNUE` is a plain Python bool baked in at import time (numba freezes globals at
+# compile time anyway), which lets numba's own dead-branch-pruning drop the `if USE_NNUE:` arm
+# entirely from the compiled `evaluate` when it's False -- the default path pays zero extra
+# compile time and never even attempts to type nnue_forward/extract_features. Deliberately an env
+# var, not a config file or a CLI flag: this only ever gets set for an offline A/B comparison
+# build (see tools/), never inside the real shipped agent.
+USE_NNUE = os.environ.get("AGENT_USE_NNUE") == "1"
+_NNUE_WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "weights", "nnue.npz")
+if USE_NNUE:
+    _NNUE_W1, _NNUE_B1, _NNUE_W2, _NNUE_B2, _NNUE_W3, _NNUE_B3 = load_weights(_NNUE_WEIGHTS_PATH)
+else:
+    _NNUE_W1, _NNUE_B1, _NNUE_W2, _NNUE_B2, _NNUE_W3, _NNUE_B3 = zero_weights()
 
 PIECE_VALUE = np.array([100, 320, 330, 500, 900, 0], dtype=np.int32)
 
@@ -793,6 +811,12 @@ def space_and_storm_score(bb: np.ndarray, phase: int) -> int:
 
 @njit(cache=False)
 def evaluate(bb: np.ndarray, meta: np.ndarray) -> int:
+    if USE_NNUE:
+        features = extract_features(bb, meta)
+        return nnue_forward(
+            features, _NNUE_W1, _NNUE_B1, _NNUE_W2, _NNUE_B2, _NNUE_W3, _NNUE_B3
+        )
+
     phase = game_phase(bb)
     score = (
         material_and_pst(bb, phase)
