@@ -483,6 +483,28 @@ loss-analysis pass (`docs/STATUS.md`'s Tier 19) for the same reason, under the s
 all remain undone, per that section's own ranking below 4.1/4.2 and the time actually spent on 4.1's
 failed attempt and the `docs/fix.md` pass that followed it.
 
+### Next step
+
+Not 4.3 — a real head-to-head (`docs/STATUS.md`'s Tier 19, +3 =4 -1 vs the pre-`docs/fix.md` build)
+already outscored 4.3's remaining items on expected payoff, and none of 4.3 addresses anything the
+six analysed losses actually showed. In order:
+
+1. **Retry 4.1 properly, not as originally scoped.** The overfitting diagnosis names the fix: far
+   fewer tunable parameters (start with the couple dozen scalar eval constants `docs/fix.md` already
+   hand-adjusted, not the full 453-parameter PST tables), a quiet-position filter on the training
+   data (`tools/texel_gen_data.py` has none today), and a held-out validation split so overfitting
+   shows up in the tuning run itself rather than only in a full arena test after the fact. See
+   `docs/fix.md`'s own Part 7 for the same list in more detail — the two docs should stay in sync on
+   this since it's the same open item from both angles.
+2. **Re-run the `docs/fix.md` loss analysis against rounds 49+** once enough rated games have been
+   played on top of this pass's fixes — the six games that analysis was built from predate the
+   mate-distance, pin/xray, and king-safety changes, so they're a stale sample for judging what (if
+   anything) still needs fixing next.
+3. **4.3, if there is runway left after both of the above** — an opening book is the cheapest, safest
+   item left on the whole list (flat lookup data, no runtime cost, no correctness risk to the search
+   or eval); the NNUE retry and the 5-man Syzygy subset both stay lowest-priority for the reasons
+   already given in that section.
+
 ---
 
 ## What gets removed (summary)

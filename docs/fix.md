@@ -268,3 +268,43 @@ Items 1 and 2 are a couple of hours and should be worth more than everything shi
 reproduced 26/36 (R42) and 34/51 (R45) of the actual moves played, so this box is not
 clock-identical to the EPYC 9V74 the platform runs on. Validate changes with `make arena`
 head-to-head against the current build, not with single-position spot checks.
+
+## Part 7 — Status and next step
+
+Items 1, 2, 3, 5, 6, and 7 are shipped (`docs/STATUS.md`'s Tier 19 section has the full writeup per
+item). Verified against the full test suite plus a new `tests/test_unstoppable_passer.py` for item
+6, and against a real 8-game 120s+0.5s head-to-head vs the pre-this-pass build (`a484b46`, the exact
+commit this file's own analysis was run against): **+3 =4 -1, 62.5%**, no crashes or illegal moves,
+4 checkmates and 4 threefold-repetition draws.
+
+**Item 4 (Texel tuning) is the one open item, deliberately not attempted this pass.** Not an
+oversight -- it had already been tried once (`32ad9e9`, before this file was written) and abandoned:
+453 independently-tuned parameters overfit noisy self-play win/loss/draw labels, confirmed by a real
+head-to-head where the untuned build led 3-2-0 through 5 of 8 games before the run was stopped.
+Re-running the existing tuner as-is would very likely reproduce that exact failure, not fix items 2
+and 3's remaining hand-picked constants (which #2 and #3 above have now made considerably less wrong
+by hand, so the marginal value of tuning them has also dropped some).
+
+**Next step, if this is picked back up:** don't re-run `tools/texel_tune.py` unchanged. The
+overfitting diagnosis from the first attempt names the fix directly:
+- **Fewer tunable parameters.** 453 (full PST tables per piece plus every positional constant) is
+  too many for the label volume available. Start with the scalar constants this file already
+  touched by hand (`XRAY_HEAVY_DIVISOR`/`PIN_KING_DIVISOR`/`PIN_XRAY_CAP`, `KING_ATTACK_COUNT_PERCENT`,
+  `KING_OPEN_FILE_BONUS`/`KING_SEMI_OPEN_FILE_BONUS`, `UNSTOPPABLE_PASSER_BONUS`, `PAWN_THREAT_BONUS`,
+  `DOUBLED_PAWN_PENALTY`/`ISOLATED_PAWN_PENALTY`) -- a few dozen values, not hundreds, and each one
+  already has a hand-reasoned direction from this file to sanity-check the tuner's output against.
+- **Filter to quiet positions.** Label noise from tactical positions (where the eval score and the
+  eventual game result diverge for reasons that have nothing to do with the static evaluation being
+  tuned) is a standard, well-documented Texel-tuning failure mode; `tools/texel_gen_data.py` does not
+  currently filter for this.
+- **A held-out validation split.** The first attempt had no way to detect overfitting except a full
+  real head-to-head after the fact -- expensive and slow to iterate on. A validation set (positions
+  not used for tuning) that the tuner reports loss against on every iteration would catch it early.
+- **Re-verify with `make arena` / `tools/head_to_head.py` before trusting any result**, exactly as the
+  first attempt's own `verify_parity()` check and the real arena test caught problems a purely
+  numerical convergence check would have missed.
+
+Separately: once this pass's fixes have played real rated games, re-run this same PGN-driven
+analysis against the new losses (if any) the way this file itself was produced -- the six games
+analysed here are now a stale sample once rounds 49+ start reflecting the mate-distance, pin/xray,
+and king-safety changes.
