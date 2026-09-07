@@ -33,7 +33,7 @@ def call_quiescence(check_budget: int) -> int:
     counters = np.zeros(2, dtype=np.int64)
     deadline = 1e18
     return sr.quiescence(
-        bb, meta, -sr.INF, sr.INF, deadline, counters, sr.QUIESCENCE_MAX_PLIES, check_budget
+        bb, meta, -sr.INF, sr.INF, deadline, counters, sr.QUIESCENCE_MAX_PLIES, check_budget, 0
     )
 
 
@@ -61,7 +61,7 @@ def main() -> None:
     mate_counters = np.zeros(2, dtype=np.int64)
     mate_score = sr.quiescence(
         checkmated_bb, checkmated_meta, -sr.INF, sr.INF, 1e18, mate_counters,
-        sr.QUIESCENCE_MAX_PLIES, sr.QSEARCH_CHECK_BUDGET,
+        sr.QUIESCENCE_MAX_PLIES, sr.QSEARCH_CHECK_BUDGET, 0,
     )
     print(f"fool's mate, white to move with no legal replies: quiescence score={mate_score}")
     if mate_score != -sr.MATE:

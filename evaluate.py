@@ -201,9 +201,16 @@ KING_DISTANCE_WEIGHT = np.int32(4)
 PAWN_THREAT_BONUS = np.int32(35)
 HANGING_PIECE_DIVISOR = np.int32(8)
 FORK_BONUS = np.int32(30)
-PIN_KING_DIVISOR = np.int32(6)
-XRAY_FLAT_BONUS = np.int32(6)
-XRAY_HEAVY_DIVISOR = np.int32(10)
+# docs/fix.md Part 3a: the original PIN_KING_DIVISOR=6/XRAY_FLAT_BONUS=6/XRAY_HEAVY_DIVISOR=10
+# priced an ordinary rook-behind-a-pawn xray at +86 and pinning a queen at +150 -- with no check
+# that the pinned/xrayed piece was even attackable, this was 25% of all non-material eval and
+# routinely outweighed a real mating attack (king_safety_score below). Divisors raised roughly
+# 3-4x and the flat bonus cut to a third to shrink the per-instance payout; PIN_XRAY_CAP (see
+# pin_and_xray_score) bounds the total regardless of how many instances stack in one position.
+PIN_KING_DIVISOR = np.int32(16)
+XRAY_FLAT_BONUS = np.int32(2)
+XRAY_HEAVY_DIVISOR = np.int32(40)
+PIN_XRAY_CAP = np.int32(40)
 KING_ZONE_ATTACK_WEIGHT = np.array([2, 20, 20, 30, 45, 0], dtype=np.int32)
 # Danger from simultaneous attackers is superlinear, not additive: a single piece bearing on the
 # ring is usually parried for free (the defender has a spare tempo), but two or more attacking at
@@ -212,7 +219,15 @@ KING_ZONE_ATTACK_WEIGHT = np.array([2, 20, 20, 30, 45, 0], dtype=np.int32)
 # Safety" article) -- indexed by the number of distinct non-pawn enemy pieces with at least one
 # hit on the ring, capped at the last entry. 0-1 attackers round the raw per-square danger down to
 # nothing; each additional attacker climbs toward the raw (100%) danger.
-KING_ATTACK_COUNT_PERCENT = np.array([0, 0, 50, 75, 88, 94, 97, 99, 100], dtype=np.int32)
+KING_ATTACK_COUNT_PERCENT = np.array([0, 20, 55, 78, 90, 96, 99, 100, 100], dtype=np.int32)
+# docs/fix.md Part 3b: an open or semi-open file next to the king is dangerous on its own -- an
+# enemy rook or queen can swing onto it regardless of how many pieces currently hit the king's own
+# ring -- so this is added on top of KING_ZONE_ATTACK_WEIGHT's ring pressure below rather than
+# folded into it (see king_safety_score), gated on the attacker actually having a rook or queen to
+# use the file with. Open (neither side has a pawn there) is worse than semi-open (only the
+# defender lacks one).
+KING_OPEN_FILE_BONUS = np.int32(25)
+KING_SEMI_OPEN_FILE_BONUS = np.int32(12)
 TEMPO_BONUS = np.int32(10)
 OCB_SCALE_PERCENT = np.int32(60)
 OUTPOST_BONUS = np.int32(20)
@@ -580,6 +595,25 @@ def threats_score(bb: np.ndarray) -> int:
 
 
 @njit(cache=False)
+def _attacker_count(bb: np.ndarray, all_occ: np.uint64, color: int, square: int) -> int:
+    """Total number of `color`'s pieces attacking `square` -- the same decomposition as
+    movegen.attacked_by, but a count rather than a bool, for pin_and_xray_score's attacker-vs-
+    defender gate below (a pinned/x-rayed piece is only worth paying for once it is actually
+    attacked more times than it can be defended -- see docs/fix.md Part 3a).
+    """
+    count = _popcount64(PAWN_ATTACKS[1 - color, square] & bb[color * 6 + PAWN])
+    count += _popcount64(KNIGHT_ATTACKS[square] & bb[color * 6 + KNIGHT])
+    count += _popcount64(KING_ATTACKS[square] & bb[color * 6 + KING])
+    count += _popcount64(
+        bishop_attacks(square, all_occ) & (bb[color * 6 + BISHOP] | bb[color * 6 + QUEEN])
+    )
+    count += _popcount64(
+        rook_attacks(square, all_occ) & (bb[color * 6 + ROOK] | bb[color * 6 + QUEEN])
+    )
+    return count
+
+
+@njit(cache=False)
 def _ray_pin_score_bishop(
     bb: np.ndarray,
     sq: int,
@@ -607,7 +641,14 @@ def _ray_pin_score_bishop(
         # other ray's original blocker unchanged (e.g. an own piece on a different rank/diagonal),
         # and intersecting the whole thing against occ_without would wrongly pick those up too.
         revealed = (extended & ~full) & occ_without
-        if revealed == 0 or revealed & own_occ:
+        # A single ray direction can only ever reveal one new occupied square (the next blocker
+        # along it) -- more than one bit here means the pairing below would be ambiguous (see
+        # docs/fix.md Part 3a), so skip rather than guess.
+        if revealed == 0 or revealed & own_occ or _popcount64(revealed) != 1:
+            continue
+        if _attacker_count(bb, all_occ, 1 - enemy, c) <= _attacker_count(bb, all_occ, enemy, c):
+            # The candidate itself is not actually attacked more than it is defended -- not
+            # attackable/winnable, so no pin/xray pressure is worth pricing (docs/fix.md Part 3a).
             continue
         candidate_pt = piece_type_at(bb, enemy, c)
         if revealed & enemy_king_bb:
@@ -644,7 +685,11 @@ def _ray_pin_score_rook(
         occ_without = all_occ & ~(ONE << np.uint64(c))
         extended = rook_attacks(sq, occ_without)
         revealed = (extended & ~full) & occ_without
-        if revealed == 0 or revealed & own_occ:
+        # See _ray_pin_score_bishop above: at most one new occupied square should ever appear
+        # here, and the attacker-vs-defender gate on the candidate itself.
+        if revealed == 0 or revealed & own_occ or _popcount64(revealed) != 1:
+            continue
+        if _attacker_count(bb, all_occ, 1 - enemy, c) <= _attacker_count(bb, all_occ, enemy, c):
             continue
         candidate_pt = piece_type_at(bb, enemy, c)
         if revealed & enemy_king_bb:
@@ -706,21 +751,46 @@ def pin_and_xray_score(bb: np.ndarray) -> int:
                 bb, sq, all_occ, own_occ, enemy_occ, enemy, enemy_king_bb
             )
 
+    # docs/fix.md Part 3a: bounds the whole term regardless of how many pins/xrays stack in one
+    # position -- the per-instance payout is now realistic, but a cap keeps a busy position from
+    # re-inflating this back into a piece-sized noise source the way the uncapped term used to.
+    if score > PIN_XRAY_CAP:
+        score = PIN_XRAY_CAP
+    elif score < -PIN_XRAY_CAP:
+        score = -PIN_XRAY_CAP
     return int(score)
 
 
 @njit(cache=False)
 def king_safety_score(bb: np.ndarray, phase: int) -> int:
-    """Attacker-weighted pressure on each king's own ring (KING_ATTACKS[king_sq], its up-to-eight
-    adjacent squares): for each enemy piece, how many of those squares it currently attacks,
-    weighted per piece type (a queen's reach into the ring is far more dangerous than a knight's).
+    """Attacker-weighted pressure on each king's own zone (its 3x3 block plus the ranks in front
+    of it -- see below) for each enemy piece, how many of those squares it currently attacks,
+    weighted per piece type (a queen's reach into the zone is far more dangerous than a knight's).
     The raw per-square sum is then scaled by KING_ATTACK_COUNT_PERCENT, indexed by how many
     distinct non-pawn pieces are attacking at all -- see that table's comment for why this needs to
     be superlinear rather than a flat sum. Phase-blended like the king PST -- full strength with
     material still on the board to attack with, zero once phase hits 0. King itself excluded as an
     attacker (kings do not approach the enemy king in the phases this term is active for) and as a
     target weight (KING_ZONE_ATTACK_WEIGHT[KING] == 0, since only the opponent's non-king pieces
-    threatening the ring matter here).
+    threatening the zone matter here).
+
+    docs/fix.md Part 3b: the zone used to be KING_ATTACKS[king_sq] alone (the up-to-eight ring
+    squares, no forward extension, not even the king's own square) -- with a ring that small,
+    2+ simultaneous attackers (needed to clear KING_ATTACK_COUNT_PERCENT's first couple of
+    near-zero entries) was rare even with real pressure building, which is exactly why a full
+    mating attack (Q+R+B+N all bearing on a bare king) was observed scoring only +31, a fraction
+    of what a single misfiring pin/xray could produce. The zone now also includes the king's own
+    square and KING_SHIELD_WHITE/BLACK[king_sq] -- the same "two ranks directly ahead, three files
+    wide" shape the pawn-shield bonus (piece_features) already uses -- which for a king still on
+    its back rank amounts to the real 3x3 block plus the ranks just in front of it real engines
+    use, rather than a ring that shrinks to a half-circle at the edge of the board.
+
+    On top of the ring/zone pressure above, an open or semi-open file next to the king (see
+    KING_OPEN_FILE_BONUS) is priced separately and added after the KING_ATTACK_COUNT_PERCENT
+    scaling, not before: a structurally weak file is dangerous by itself even with zero pieces
+    currently touching the zone (the classic "nothing attacking yet, but the rook will get there"
+    case), so it should not be zeroed out by an attacker_count of 0 or 1 the way ring pressure
+    correctly is.
     """
     if phase == 0:
         return 0
@@ -733,7 +803,9 @@ def king_safety_score(bb: np.ndarray, phase: int) -> int:
     for color in range(2):
         sign = np.int32(1) if color == WHITE else np.int32(-1)
         enemy = 1 - color
-        zone = KING_ATTACKS[king_square(bb, enemy)]
+        king_sq = king_square(bb, enemy)
+        shield = KING_SHIELD_WHITE[king_sq] if enemy == WHITE else KING_SHIELD_BLACK[king_sq]
+        zone = KING_ATTACKS[king_sq] | (ONE << np.uint64(king_sq)) | shield
         danger = np.int32(0)
         attacker_count = 0
 
@@ -764,6 +836,19 @@ def king_safety_score(bb: np.ndarray, phase: int) -> int:
 
         percent = KING_ATTACK_COUNT_PERCENT[min(attacker_count, count_cap)]
         danger = danger * percent // np.int32(100)
+
+        if bb[color * 6 + ROOK] or bb[color * 6 + QUEEN]:
+            king_file = king_sq % 8
+            lo = king_file - 1 if king_file > 0 else 0
+            hi = king_file + 1 if king_file < 7 else 7
+            for f in range(lo, hi + 1):
+                if bb[enemy * 6 + PAWN] & FILE_MASKS[f]:
+                    continue
+                if bb[color * 6 + PAWN] & FILE_MASKS[f]:
+                    danger += KING_SEMI_OPEN_FILE_BONUS
+                else:
+                    danger += KING_OPEN_FILE_BONUS
+
         score += sign * (danger * np.int32(phase) // np.int32(PHASE_MAX))
 
     return int(score)

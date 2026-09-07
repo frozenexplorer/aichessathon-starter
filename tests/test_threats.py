@@ -46,9 +46,13 @@ def main() -> None:
         print("  FAIL: expected a positive absolute-pin bonus")
         failures += 1
 
-    # White rook a1 - black bishop a4 - black queen a8, all on the a-file: an x-ray/skewer, since
-    # the queen (more valuable) sits directly behind the bishop from the rook's point of view.
-    xray_threats, xray_pins = score("q3k3/8/8/8/b7/8/8/R3K3 w - - 0 1")
+    # White rook a1, white knight b2, black bishop a4, black queen a8, all bearing on a4: an
+    # x-ray/skewer, since the queen (more valuable) sits directly behind the bishop from the
+    # rook's point of view. The knight is there so the bishop is attacked (rook + knight) more
+    # times than it is defended (queen alone) -- docs/fix.md Part 3a's gate requires that before
+    # paying anything, so a lone rook behind a lone defended piece (the queen defends the bishop
+    # from behind on the same file) would otherwise score zero.
+    xray_threats, xray_pins = score("q3k3/8/8/8/b7/8/1N6/R3K3 w - - 0 1")
     print(f"rook x-rays bishop into queen: threats={xray_threats} pins={xray_pins}")
     if xray_pins <= 0:
         print("  FAIL: expected a positive x-ray/skewer bonus")

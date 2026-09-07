@@ -44,6 +44,14 @@ MAX_EXTENSION_FRACTION = 0.35
 # pawn-ish trade, not noise from a stable evaluation.
 SCORE_SWING_CP = 60
 
+# A root score DROP (not just any swing -- see agent._is_volatile) of at least this much between
+# the last two completed depths marks the position as volatile on its own. Smaller than
+# SCORE_SWING_CP: a fail-low is a threat the shallower depth missed just surfacing, the classic
+# "about to blunder" signal (docs/fix.md Part 4), which deserves a faster reaction than an
+# equally-sized improvement -- an improvement of the same magnitude carries no comparable urgency
+# and can wait for the symmetric SCORE_SWING_CP check above to catch it if it's large enough.
+FAIL_LOW_SWING_CP = 40
+
 # Total pieces (both colours, kings included) at or below this marks a position as a simplified
 # endgame worth searching deeper, mirroring the FUTURE.md rationale directly.
 LOW_PIECE_COUNT = 12

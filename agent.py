@@ -89,11 +89,6 @@ _opponent_history_len = 0
 
 (_tt_key, _tt_depth, _tt_score, _tt_flag, _tt_from, _tt_to, _tt_promo) = sr.new_tt()
 
-# Piece count as of the previous get_move call's root, for the adaptive-time volatility check
-# below (_is_volatile) -- None until the first real move decision.
-_prev_piece_count: int | None = None
-
-
 def get_move(fen: str, time_left_ms: int) -> str:
     """Return a legal move in UCI notation.
 
@@ -101,7 +96,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     time_left_ms  your clock before this move, in milliseconds
     returns       "e2e4", or "e7e8q" for a promotion
     """
-    global _history_len, _opponent_history_len, _prev_piece_count
+    global _history_len, _opponent_history_len
 
     start = time.perf_counter()
     bb, meta = bbm.from_fen(fen)
@@ -152,11 +147,10 @@ def get_move(fen: str, time_left_ms: int) -> str:
         prev_iteration_elapsed: float | None = None
         prev_best_move: tuple[int, int, int] | None = None
         best_move_changed = False
+        prev_mate_ply: int | None = None
         depth = 1
         while True:
-            volatile = _is_volatile(
-                bb, meta, prev_score, None, piece_count, _prev_piece_count, best_move_changed
-            )
+            volatile = _is_volatile(bb, meta, prev_score, None, piece_count, best_move_changed)
             deadline = max_deadline if volatile else base_deadline
             if prev_iteration_elapsed is not None:
                 remaining = deadline - time.perf_counter()
@@ -181,16 +175,29 @@ def get_move(fen: str, time_left_ms: int) -> str:
             prev_best_move = (f, t, p)
             pv_from, pv_to, pv_promo = f, t, p
             still_volatile = _is_volatile(
-                bb, meta, prev_score, score, piece_count, _prev_piece_count, best_move_changed
+                bb, meta, prev_score, score, piece_count, best_move_changed
             )
             next_deadline = max_deadline if still_volatile else base_deadline
             over_time = time.perf_counter() >= next_deadline
-            if over_time or abs(score) >= MATE_THRESHOLD or depth >= MAX_DEPTH:
+            # A losing mate score never stops the loop by itself (docs/fix.md Part 2): mate
+            # distance is now real (search.py's leaves return -MATE + ply, not a flat -MATE), so a
+            # shallower "mate in 3" can still turn into real resistance -- or even an escape the
+            # shallower depth missed -- one ply deeper, and there is no reason to stop thinking
+            # early just because the position currently looks lost. A winning mate score only
+            # stops the loop once the mate distance itself has stopped shrinking between
+            # consecutive completed depths -- otherwise a stale "mate in 9" TT hit surfacing at a
+            # shallow depth would end the search before it ever looks for the real mate in 2 (the
+            # exact bug docs/fix.md Part 1 documented from these games' PGNs).
+            mate_ply = sr.MATE - score if score >= MATE_THRESHOLD else None
+            mate_converged = (
+                mate_ply is not None and prev_mate_ply is not None and mate_ply >= prev_mate_ply
+            )
+            if over_time or depth >= MAX_DEPTH or mate_converged:
                 break
+            prev_mate_ply = mate_ply
             prev_score = score
             depth += 1
 
-    _prev_piece_count = piece_count
     best_from, best_to, best_promo = _record_and_return(bb, meta, best_from, best_to, best_promo)
     return bbm.move_uci(best_from, best_to, best_promo)
 
@@ -201,27 +208,37 @@ def _is_volatile(
     prev_score: int | None,
     score: int | None,
     piece_count: int,
-    prev_piece_count: int | None,
     best_move_changed: bool,
 ) -> bool:
     """Whether the position looks sharp enough to deserve more than the base time budget -- see
     docs/FUTURE.md item 1: a score swing between the last two completed iterative-deepening
-    depths, a position not in a quiet state (in check, a capture just landed us here), or few
-    enough pieces left that precise endgame play matters. best_move_changed (the root's chosen
-    move differed between the last two completed depths) is an equally strong signal real engines
-    use -- a best move that just changed at the last depth deserves the room to confirm itself at
-    the next one too; a best move that has stayed put needs no extra help from this check alone
-    (the other signals above still apply on their own merits either way, so a stable move in a
-    genuinely sharp or low-material position still gets the extended budget it needs).
+    depths, a position not in a quiet state (in check), or few enough pieces left that precise
+    endgame play matters. best_move_changed (the root's chosen move differed between the last two
+    completed depths) is an equally strong signal real engines use -- a best move that just
+    changed at the last depth deserves the room to confirm itself at the next one too; a best move
+    that has stayed put needs no extra help from this check alone (the other signals above still
+    apply on their own merits either way, so a stable move in a genuinely sharp or low-material
+    position still gets the extended budget it needs).
+
+    docs/fix.md Part 4: no longer triggers on "a capture just happened" (piece_count dropping
+    since the last real move decision) -- that fired on ~50% of moves across the analysed losing
+    games, the overwhelming majority forced recaptures needing no extra thought at all, and it
+    burned budget on those at the expense of the genuinely sharp quiet moves later in the same
+    games that actually needed it. A dedicated fail-low check replaces part of what that trigger
+    was meant to catch: a root score that DROPS by at least FAIL_LOW_SWING_CP from the previous
+    completed depth is treated as volatile on its own, at a smaller margin than the symmetric
+    score-swing check below -- a drop is a real threat the shallower depth missed just surfacing
+    (the classic "about to blunder" signal), which deserves a faster reaction than an equally-sized
+    improvement, which carries no comparable urgency.
     """
     if best_move_changed:
         return True
-    swing = None if prev_score is None or score is None else abs(score - prev_score)
-    if swing is not None and swing >= timeman.SCORE_SWING_CP:
-        return True
+    if prev_score is not None and score is not None:
+        if prev_score - score >= timeman.FAIL_LOW_SWING_CP:
+            return True
+        if abs(score - prev_score) >= timeman.SCORE_SWING_CP:
+            return True
     if mg.is_check(bb, meta):
-        return True
-    if prev_piece_count is not None and piece_count < prev_piece_count:
         return True
     return piece_count <= timeman.LOW_PIECE_COUNT
 

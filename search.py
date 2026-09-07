@@ -469,7 +469,7 @@ _I8_1D = nbtypes.int8[::1]
 _I8_2D = nbtypes.int8[:, ::1]
 _I32_2D = nbtypes.int32[:, ::1]
 
-_QUIESCENCE_SIG = _I64(_BB_T, _META_T, _I64, _I64, _F64, _I64_1D, _I64, _I64)
+_QUIESCENCE_SIG = _I64(_BB_T, _META_T, _I64, _I64, _F64, _I64_1D, _I64, _I64, _I64)
 
 _NEGAMAX_SIG = _I64(
     _BB_T, _META_T, _I64, _I64, _I64, _F64, _I64_1D, _I64,
@@ -803,6 +803,7 @@ def quiescence(
     counters: np.ndarray,
     qdepth: int,
     check_budget: int,
+    ply: int,
 ) -> int:
     counters[0] += 1
     if _time_up(deadline, counters):
@@ -813,7 +814,7 @@ def quiescence(
 
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     if count == 0:
-        return -MATE if is_check(bb, meta) else 0
+        return -MATE + ply if is_check(bb, meta) else 0
 
     if check_budget > 0 and is_check(bb, meta):
         for i in range(count):
@@ -822,7 +823,8 @@ def quiescence(
             p = _i64(promo_arr[i])
             new_bb, new_meta = make_move(bb, meta, f, t, p)
             score = -quiescence(
-                new_bb, new_meta, -beta, -alpha, deadline, counters, qdepth, check_budget - 1
+                new_bb, new_meta, -beta, -alpha, deadline, counters, qdepth, check_budget - 1,
+                ply + 1,
             )
             if counters[1]:
                 return 0
@@ -870,7 +872,8 @@ def quiescence(
         p = _i64(promo_arr[idx])
         new_bb, new_meta = make_move(bb, meta, f, t, p)
         score = -quiescence(
-            new_bb, new_meta, -beta, -alpha, deadline, counters, qdepth - 1, check_budget
+            new_bb, new_meta, -beta, -alpha, deadline, counters, qdepth - 1, check_budget,
+            ply + 1,
         )
         if counters[1]:
             return 0
@@ -1011,12 +1014,13 @@ def negamax(
 
     if depth <= 0:
         return quiescence(
-            bb, meta, alpha, beta, deadline, counters, QUIESCENCE_MAX_PLIES, QSEARCH_CHECK_BUDGET
+            bb, meta, alpha, beta, deadline, counters, QUIESCENCE_MAX_PLIES, QSEARCH_CHECK_BUDGET,
+            ply,
         )
 
     from_arr, to_arr, promo_arr, count = generate_legal(bb, meta)
     if count == 0:
-        return -MATE if is_check(bb, meta) else 0
+        return -MATE + ply if is_check(bb, meta) else 0
 
     in_check = is_check(bb, meta)
 
@@ -1053,7 +1057,8 @@ def negamax(
         and static_eval + RAZOR_MARGIN[depth] <= alpha
     ):
         razor_score = quiescence(
-            bb, meta, alpha, beta, deadline, counters, QUIESCENCE_MAX_PLIES, QSEARCH_CHECK_BUDGET
+            bb, meta, alpha, beta, deadline, counters, QUIESCENCE_MAX_PLIES, QSEARCH_CHECK_BUDGET,
+            ply,
         )
         if counters[1]:
             return 0
