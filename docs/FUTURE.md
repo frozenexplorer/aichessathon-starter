@@ -4,9 +4,9 @@ Ranked by strength-gained-per-day-of-effort given the 2026-09-11 11:00 London de
 raw impact alone. Tier 1 (transposition table, killer/history move ordering, PVS, DTZ tablebase,
 tapered/richer evaluation) and Tier 2 (items 1-7 below) are both shipped; see `docs/STATUS.md`
 for what each covers and the current verified state, including why items 8-10 remain undone for
-reasons specific to each, not time pressure. Tiers 3-18 are further passes shipped on top of this
+reasons specific to each, not time pressure. Tiers 3-19 are further passes shipped on top of this
 list, none of them part of the original prioritization here -- see `docs/STATUS.md`'s own
-Tier 3 through Tier 18 sections for what each covers (in short: Tier 3 mobility/futility/bigger
+Tier 3 through Tier 19 sections for what each covers (in short: Tier 3 mobility/futility/bigger
 TT/IID/counter-move/delta pruning; Tier 4 endgame-specific eval; Tier 5 threat/pin/x-ray eval;
 Tier 6 a quiescence-in-check search bug fix; Tier 7 history malus; Tier 8 king safety eval;
 Tier 9 reverse-futility and late-move pruning; Tier 10 fifty-move-rule draw detection; Tier 11
@@ -31,7 +31,15 @@ an allocation-free occupancy-based SEE rewrite, staged move-ordering selection i
 direct-check-only test, and a handful of ordering fixes (a promotion-scoring bug, deduped
 `is_capture` calls, a tighter branching-factor estimate, a widening aspiration-window ladder) --
 node rate up ~30-55% cumulatively with zero init-time cost, see `docs/STATUS.md`'s Tier 18 section
-for the full breakdown and numbers. Tier 13 was also trial-reverted and restored in between
+for the full breakdown and numbers. Tier 19 caught up four previously-undocumented commits (a
+gated-off trained NNUE eval that lost real-contract to the handcrafted one, Phase 4.2 search
+improvements, an abandoned Texel-tuning attempt, and a `king_safety_score`/unstoppable-passer eval
+change), then worked through `docs/fix.md` (a PGN-driven analysis of six real rated losses): mate
+scores now carry real ply distance, `pin_and_xray_score` defanged (was 25% of all non-material
+eval), `king_safety_score`'s zone widened past the bare 8-square ring, and a volatility trigger
+that was burning budget on forced recaptures replaced with a dedicated fail-low check -- see
+`docs/STATUS.md`'s Tier 19 section for the full writeup and the real 8-game 120s+0.5s head-to-head
+result (+3 =4 -1, 62.5%) against the pre-round build. Tier 13 was also trial-reverted and restored in between
 shipping and Tier 14 -- see `docs/STATUS.md`'s "Known risk: init-time margin" section for that
 whole round trip and why it ended back where it started; that same section now also carries Tier
 16's confirmation that the real init cap really is 90s, not the 60s this repo's own
@@ -42,7 +50,8 @@ Re-run the full gate -- `tests/perft.py`, `tests/test_repetition.py`, `tests/tes
 `tests/test_magic_attacks.py`, `tests/test_threats.py`, `tests/test_quiescence_check.py`,
 `tests/test_king_safety.py`, `tests/test_fifty_move.py`, `tests/test_insufficient_material.py`,
 `tests/test_timeman.py`, `tests/test_singular_extension.py`, `tests/test_tempo_and_ocb.py`,
-`tests/test_bit_ops.py`, `tests/test_zobrist_hash.py` (both Tier 18), `ruff`, and `mypy --strict`
+`tests/test_bit_ops.py`, `tests/test_zobrist_hash.py` (both Tier 18),
+`tests/test_unstoppable_passer.py` (Tier 19), `ruff`, and `mypy --strict`
 (explicitly against `movegen.py`/`evaluate.py`/`search.py` too, not just the `agent.py`/`harness`
 the `[tool.mypy]` `files` config covers by default -- still an open gap, see `docs/plan.md`) --
 after any change to `search.py`, `movegen.py`, `attacks.py`, `evaluate.py`, `timeman.py`,
@@ -165,10 +174,10 @@ search/movegen speed.
     suite. Node rate up ~30-55% cumulatively, zero init-time cost -- see `docs/STATUS.md`'s Tier 18
     section for the full breakdown and numbers, `docs/plan.md` for the original writeup.
 
-13. **[NOT STARTED] `docs/plan.md` Phase 3 (trained NNUE)** -- explicitly deferred behind Phase 2
-    per the plan's own sequencing. Spends the ~43MB of zip headroom left after `weights/syzygy/`
-    and `weights/attacks.npz` (Tier 17) -- the biggest strength ceiling available, but multi-day
-    (self-play or externally-annotated training data, PyTorch training offline, quantised `int16`
-    export, an njit inference forward pass -- never torch/onnxruntime at inference time, per-node
-    call overhead would be fatal inside a search doing 100k+ nodes) and shipped only if it beats the
-    handcrafted eval over a real arena run (>=40 games). See `docs/plan.md` for the full writeup.
+13. **[TRIED, Tier 19 catch-up (`2a2e381`), lost -- stays off] `docs/plan.md` Phase 3 (trained
+    NNUE)** -- a small feedforward net (768->512->32->1) trained on self-play positions labelled
+    by fixed-depth `negamax` scores, wired behind `evaluate.USE_NNUE` (off by default, zero extra
+    compile cost when off). Real-contract head-to-head lost 0-5 to the handcrafted eval, so per the
+    plan's own gate it does not ship. The self-play/training pipeline (`tools/nnue_*.py`) is kept
+    for a future retry with deeper labels -- label quality, not data quantity, was judged the
+    bottleneck. See `docs/STATUS.md`'s Tier 19 section and `docs/plan.md` for the full writeup.

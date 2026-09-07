@@ -1,6 +1,6 @@
 # Status
 
-Handoff snapshot as of the Tier 16 pass (2026-09-05), on top of Tiers 1-15 (Tier 2 commit
+Handoff snapshot as of the Tier 19 pass (2026-09-07), on top of Tiers 1-18 (Tier 2 commit
 `02ec418`, Tier 1 commit `12a38f9`), all documented in their own sections below. Read this instead
 of replaying the whole build history.
 Competition context: uploads close 2026-09-11 11:00 London; the rated ladder runs hourly
@@ -25,9 +25,11 @@ still verified with the full correctness gate (`ruff`, `mypy --strict`, `tests/p
 `tests/test_threats.py`, from Tier 6 onward `tests/test_quiescence_check.py`, from Tier 8 onward
 `tests/test_king_safety.py`, from Tier 10 onward `tests/test_fifty_move.py`, from Tier 11 onward
 `tests/test_insufficient_material.py`, from Tier 12 onward `tests/test_timeman.py`, from Tier 13
-onward `tests/test_singular_extension.py`, from Tier 14 onward `tests/test_tempo_and_ocb.py`, and
-from Tier 15 onward `tests/test_lazy_smp.py`) plus functional games (checkmates from the start
-position and the KBN-vs-K tablebase endgame, both colours) before moving to the next.
+onward `tests/test_singular_extension.py`, from Tier 14 onward `tests/test_tempo_and_ocb.py`, from
+Tier 15 onward `tests/test_lazy_smp.py` (deleted in Tier 17 along with Lazy SMP itself), from
+Tier 18 onward `tests/test_bit_ops.py`/`tests/test_zobrist_hash.py`, and from Tier 19 onward
+`tests/test_unstoppable_passer.py`) plus functional games (checkmates from the start position and
+the KBN-vs-K tablebase endgame, both colours) before moving to the next.
 
 ## Architecture
 
@@ -48,12 +50,15 @@ evaluate.py     tapered material + PST (midgame/endgame king blend by game phase
                 bishop pair, rook open/semi-open files, king pawn-shield, differential piece
                 mobility, king proximity to passed-pawn promotion squares, tactical threat
                 awareness (hanging pieces, pawn threats, forks, absolute pins, x-rays/skewers),
-                king safety (attacker-weighted pressure on each king's own ring), a flat tempo
-                bonus for the side to move, opposite-coloured-bishop draw scaling, knight outpost
-                bonus, a space/pawn-storm term (Tier 16) -- all jitted
+                king safety (attacker-weighted pressure on each king's own zone -- widened Tier 19
+                from the bare 8-square ring to include the king's own square and shield squares),
+                an unstoppable-passed-pawn rule-of-the-square check (Tier 19 catch-up), a flat
+                tempo bonus for the side to move, opposite-coloured-bishop draw scaling, knight
+                outpost bonus, a space/pawn-storm term (Tier 16) -- all jitted
 zobrist.py      position hashing, for repetition detection and the transposition table
-search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table (8M
-                buckets, ~320MB), killer-move + history (with malus) + counter-move ordering,
+search.py       negamax/alpha-beta, iterative deepening, a two-tier transposition table (16M
+                buckets, ~640MB as of Phase 4.2's `eeec280`), killer-move + history (with malus) +
+                counter-move ordering,
                 principal variation search (PVS) with aspiration windows, null-move pruning,
                 adaptive (depth/move-index table-driven, Tier 16) late move reductions and
                 pruning, check extensions, singular extensions (excluded-move verification
@@ -971,6 +976,99 @@ checkmate, no crashes.
 own sequencing ("Phase 3, flagged, shipped only on arena evidence" -- see Sequencing item 7 there).
 Multi-day scope against the runway remaining; picked up separately if there is time to spare.
 
+## Tier 19: catching up since Tier 18, plus `docs/fix.md`'s loss-analysis fixes
+
+Four commits shipped between Tier 18 and this pass without a dedicated section here -- summarized
+briefly since each is already fully documented in its own commit message -- then the loss-analysis
+work that prompted this section:
+
+- **Phase 3 (`2a2e381`): trained NNUE eval, gated off.** A small feedforward net (768->512->32->1)
+  trained on self-play positions labelled by fixed-depth `negamax` scores, wired behind
+  `evaluate.USE_NNUE` (an env var, off by default -- numba's dead-branch pruning drops the
+  unreached arm entirely, zero extra compile cost when off). Real-contract head-to-head lost 0-5 to
+  the handcrafted eval, so per the plan's own gate this does not ship and stays off; the pipeline
+  (`tools/nnue_*.py`) is kept for a future retry with deeper labels.
+- **Phase 4.2 (`eeec280`): search improvements.** Continuation history (a second move-ordering
+  signal on top of from/to history), TT doubled again (`1<<24` buckets, ~640MB), eager numba
+  signatures on `negamax`/`quiescence`/`search_root`/`make_move` (structural insurance against a
+  repeat of Tier 16's duplicate-specialisation regression), history-scaled LMR, SEE pruning in the
+  main search (not just quiescence), razoring, asymmetric aspiration windows, and a root best-move
+  change added as a volatility signal in `timeman`. Real-contract head-to-head vs the pre-Phase-4
+  build: +2 =0 -2 over 4 games -- too few to resolve Elo, but every change has strong literature
+  priors and passed correctness verification independently.
+- **Texel tuning attempted (`32ad9e9`), not shipped.** `tools/texel_gen_data.py` /
+  `tools/texel_tune.py`: coordinate-descent tuning of material + PST values against self-play
+  win/loss/draw outcomes (K=400 sigmoid fit). 453 independently-tuned parameters against noisy
+  labels overfit -- non-converging, visibly non-smooth PST tables on both a 20k and the full 57.5k
+  position run, confirmed by a real head-to-head where the untuned build led 3-2-0 through 5 of 8
+  games before the run was stopped. Nothing applied to `evaluate.py`'s constants; kept for a future
+  retry with a smaller parameter set, quiet-position filtering, and/or a held-out validation split.
+- **King safety + unstoppable passer (`a484b46`).** `king_safety_score` changed from an additive
+  per-square sum to the standard attacker-count percent-scaled table (still the bare 8-square ring
+  at this point -- widened below), and a new `unstoppable_passed_pawn_score` priced a passed pawn
+  the defending king (with no rook/queen left) cannot catch as effectively won/lost.
+
+**This pass -- `docs/fix.md`: a PGN-driven analysis of rounds 42-48** (1 win, 5 losses, every loss
+ending in checkmate, none on time or adjudication) found and fixed six of its seven issues:
+
+- **Mate scores now carry real distance.** `search.py`'s two leaf mate returns were a flat `+-MATE`
+  -- mate-in-1 and mate-in-9 scored identically, so a losing search walked into the fastest
+  available mate (tie-broken by arbitrary move-ordering) and a winning search couldn't find the
+  *fastest* mate once any mate score surfaced anywhere in a persistent, game-long TT. Both sites now
+  return `-MATE + ply`, with `ply` threaded through `quiescence` (previously the only mate-scoring
+  site with no ply awareness at all). `agent.py`'s iterative-deepening break no longer stops on a
+  losing mate score at all (a shallower "mate in 3" can still turn into real resistance, or even an
+  escape, one ply deeper) and only stops on a winning one once the mate distance itself stops
+  shrinking between completed depths -- not on the first mate score seen, the exact bug that let a
+  stale TT hit end the search instantly. This also un-poisons `_tt_resolve`'s existing
+  ply-adjustment arithmetic (`search.py`'s own module docstring already described it as correcting
+  for mate distance), which had nothing correctly-encoded to adjust before this.
+- **`pin_and_xray_score` defanged.** Measured at 25% of all non-material eval, capable of
+  outweighing a real mating attack roughly 2-to-1 (a rook x-raying through a pawn at a queen scored
+  +86 -- an ordinary, worth-approximately-zero configuration). `PIN_KING_DIVISOR` 6->16,
+  `XRAY_FLAT_BONUS` 6->2, `XRAY_HEAVY_DIVISOR` 10->40, a new `PIN_XRAY_CAP` (+-40 total), and a
+  pinned/x-rayed piece now has to be attacked more times than it can be defended (a new
+  `_attacker_count` helper, the same attack-decomposition `movegen.attacked_by` uses but returning a
+  count) before paying anything -- plus a `_popcount64(revealed) != 1` guard against the
+  mis-pairing risk `docs/fix.md` flagged (a ray extension can in principle reveal more than one
+  newly-occupied square; skip rather than guess which one pairs with the candidate).
+- **King safety made real.** The zone was `KING_ATTACKS[king_sq]` alone -- the bare 8-square ring,
+  no forward extension, not even the king's own square -- so a full Q+R+B+N mating attack on a bare
+  king measured +31, dwarfed by a single misfiring x-ray. Widened to the ring plus the king's own
+  square plus `KING_SHIELD_WHITE`/`BLACK[king_sq]` (the same "two ranks ahead, three files wide"
+  shape the pawn-shield bonus in `piece_features` already uses), `KING_ATTACK_COUNT_PERCENT`
+  retuned toward the standard superlinear-danger table, and a new open/semi-open-file-to-king term
+  (gated on the attacker actually having a rook or queen, added after the percent scaling rather
+  than folded into `danger` so it isn't zeroed out by a low ring-attacker count the way ring
+  pressure correctly is).
+- **Volatility triggers.** `agent._is_volatile`'s "a capture just happened" trigger (piece count
+  dropped since the last real move decision) fired on 42-70% of moves across the analysed games,
+  the overwhelming majority forced recaptures needing no extra thought -- dropped entirely.
+  Replaced with a dedicated fail-low check (`timeman.FAIL_LOW_SWING_CP = 40`, smaller than the
+  existing symmetric `SCORE_SWING_CP = 60`): a root score drop between the last two completed
+  depths is a real threat surfacing, worth reacting to faster than an equally-sized improvement,
+  which carries no comparable urgency.
+- **Unstoppable passer verified, not changed.** `UNSTOPPABLE_PASSER_BONUS` (500, a 9%-of-positions,
+  874cp-max term from Tier 19's own `a484b46` catch-up above) was flagged as new and unverified. New
+  `tests/test_unstoppable_passer.py` checks the classical rule-of-the-square logic directly,
+  including the one-tempo discount edge case (a king whose Chebyshev distance to the promotion
+  square exactly ties the pawn's own distance must read as caught when the defender is to move,
+  uncaught when they are not) -- all cases pass, so the constant was left as-is rather than blindly
+  halved.
+- **Not done: `docs/fix.md`'s Texel-tuning item** ("ship the tuner against a real labelled set and
+  let it set these constants"). Already attempted this same session (`32ad9e9` above) and abandoned
+  for documented reasons (overfitting on noisy labels, a lost real head-to-head); redoing it
+  properly needs a smaller parameter set and a held-out validation split -- a separate multi-hour
+  effort, not a bounded fix, left for a future pass rather than risk repeating that failure under
+  time pressure.
+
+**Verified:** `ruff`/`mypy --strict` clean; all 13 pre-existing `tests/*.py` plus the new
+`tests/test_unstoppable_passer.py` pass; `tests/perft.py` clean (0 mismatches, all depths). Real
+8-game 120s+0.5s head-to-head against the pre-this-pass build (`a484b46`, the exact commit
+`docs/fix.md` itself analysed): **+3 =4 -1, 62.5%** -- 4 checkmates, 4 threefold-repetition draws,
+1 loss, no crashes or illegal moves in any game, split across 4 parallel processes to keep wall
+time down.
+
 ## What's implemented and verified
 
 - `ruff` / `mypy --strict` clean. `tests/perft.py` (movegen, unaffected by Tier 1, differentially
@@ -1230,3 +1328,24 @@ writeup and numbers. `docs/plan.md`'s Phase 3 (a trained NNUE spending the ~43MB
 Tier 17 confirmed is available) remains not started -- multi-day scope, shipped only on real arena
 evidence per the plan's own acceptance criterion, picked up only if there is runway to spare once
 everything else here is done.
+
+A sixth round (Tier 19) started with four commits that had shipped without their own STATUS.md
+section -- Phase 3's NNUE eval (trained, gated off behind `evaluate.USE_NNUE`, lost 0-5 real-contract
+to the handcrafted eval), Phase 4.2's search improvements (continuation history, another TT
+doubling, eager numba signatures, history-scaled LMR, main-search SEE pruning, razoring, asymmetric
+aspiration windows), a first Texel-tuning attempt (built, ran, and deliberately not applied --
+453 parameters overfit noisy labels), and an eval change to `king_safety_score` (attacker-count
+percent scaling) plus a new `unstoppable_passed_pawn_score` -- see Tier 19's own section above for
+each commit's one-paragraph summary. The round's main work was `docs/fix.md`, a PGN-driven analysis
+of six real rated losses (rounds 42-48, every one ending in checkmate): fixed mate scores carrying
+no ply distance (the root cause of both "walks into the fastest mate when losing" and "can't find
+the fastest mate when winning"), defanged `pin_and_xray_score` (25% of all non-material eval,
+capable of outweighing a real mating attack), widened `king_safety_score`'s zone from a bare
+8-square ring that let a full Q+R+B+N mating attack score +31, and replaced a volatility trigger
+that was burning time budget on forced recaptures with a dedicated fail-low check. Verified the one
+term flagged as new-and-unverified (`unstoppable_passed_pawn_score`) against a new rule-of-the-square
+test suite rather than guessing at a fix. Declined to re-attempt the analysis's Texel-tuning
+recommendation given the already-documented overfitting failure earlier in this same round --
+flagged for a future pass with a smaller parameter set and a held-out split, not rushed under time
+pressure. A real 8-game 120s+0.5s head-to-head against the pre-round build (`a484b46`) went
++3 =4 -1, 62.5%, no crashes or illegal moves.

@@ -455,6 +455,34 @@ the data-generation investment already made into real Elo before the deadline.
 **If only one thing gets done from this phase: 4.1.** It is the best risk-adjusted use of both the
 time remaining and the data-generation work already sunk into Phase 3.
 
+## Phase 4 result (for the record)
+
+**4.2 shipped** (`eeec280`): continuation history, another TT doubling (now 16M buckets, ~640MB),
+eager numba signatures on the four hottest functions (structural insurance against a repeat of the
+Tier 16 duplicate-specialisation regression — see `docs/STATUS.md`), history-scaled LMR, SEE
+pruning in the main search (not just quiescence), razoring, asymmetric aspiration windows, and a
+root best-move change added as a `timeman` volatility signal. Real-contract head-to-head vs the
+pre-Phase-4 build: +2 =0 -2 over 4 games — too few to resolve Elo on its own, but every item has
+strong literature priors and passed correctness verification independently of that result.
+
+**4.1 attempted, not shipped** (`32ad9e9`): `tools/texel_gen_data.py`/`tools/texel_tune.py`,
+coordinate-descent tuning of material + PST values against self-play win/loss/draw outcomes
+(K=400 sigmoid fit), with a `verify_parity()` differential check against the real `evaluate()`
+before trusting any run — caught and fixed a real numba bug along the way (module-level global
+arrays are frozen into compiled code at first call, so the tunable arrays had to be threaded as
+live function arguments instead). Even after that fix, two tuning runs (20k and the full 57.5k
+positions) produced non-converging, visibly non-smooth PST tables — 453 independently-tuned
+parameters against noisy labels overfits, confirmed by a real head-to-head where the untuned build
+led 3-2-0 through 5 of 8 games before the run was stopped. Nothing applied to `evaluate.py`'s
+constants. Matches Phase 3's own read exactly: label/data quality, not effort spent building the
+pipeline, is the bottleneck. Kept for a future retry with a smaller parameter set, quiet-position
+filtering, and/or a held-out validation split — not attempted again during `docs/fix.md`'s own
+loss-analysis pass (`docs/STATUS.md`'s Tier 19) for the same reason, under the same time pressure.
+
+**4.3 not started** — an opening book, a deeper-label NNUE retry, and a curated 5-man Syzygy subset
+all remain undone, per that section's own ranking below 4.1/4.2 and the time actually spent on 4.1's
+failed attempt and the `docs/fix.md` pass that followed it.
+
 ---
 
 ## What gets removed (summary)
