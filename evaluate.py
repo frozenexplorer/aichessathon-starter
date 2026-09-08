@@ -417,13 +417,15 @@ def passed_pawn_king_distance(bb: np.ndarray, phase: int) -> int:
 
 @njit(cache=False)
 def unstoppable_passed_pawn_score(bb: np.ndarray, phase: int, turn: int) -> int:
-    """See UNSTOPPABLE_PASSER_BONUS above: for each passed pawn whose defender has no rook or
-    queen left, checks the classical rule of the square (defending king's Chebyshev distance to
-    the promotion square vs. the pawn's own distance there, with a one-square discount for the
-    defender when it is their move to account for the tempo) and prices it as effectively decisive
-    the moment the king cannot make the square -- not a small nudge like passed_pawn_king_distance,
-    since no amount of search depth changes a bare king's inability to catch a pawn it cannot
-    reach in time.
+    """See UNSTOPPABLE_PASSER_BONUS above: for each passed pawn whose defender has nothing left but
+    a bare king (no rook, queen, bishop, or knight -- any of those can reroute to intercept or
+    blockade a pawn's path in ways a king's straight-line race cannot, so the pure rule-of-the-
+    square below is only sound once none of them are on the board at all), checks the classical
+    rule of the square (defending king's Chebyshev distance to the promotion square vs. the pawn's
+    own distance there, with a one-square discount for the defender when it is their move to
+    account for the tempo) and prices it as effectively decisive the moment the king cannot make
+    the square -- not a small nudge like passed_pawn_king_distance, since no amount of search depth
+    changes a bare king's inability to catch a pawn it cannot reach in time.
     """
     endgame_weight = PHASE_MAX - phase
     if endgame_weight == 0:
@@ -432,7 +434,11 @@ def unstoppable_passed_pawn_score(bb: np.ndarray, phase: int, turn: int) -> int:
     white_pawns = bb[WHITE * 6 + PAWN]
     black_pawns = bb[BLACK * 6 + PAWN]
 
-    if not (bb[BLACK * 6 + ROOK] or bb[BLACK * 6 + QUEEN]):
+    black_has_blocker = (
+        bb[BLACK * 6 + ROOK] or bb[BLACK * 6 + QUEEN]
+        or bb[BLACK * 6 + BISHOP] or bb[BLACK * 6 + KNIGHT]
+    )
+    if not black_has_blocker:
         bk = king_square(bb, BLACK)
         remaining = white_pawns
         while remaining:
@@ -447,7 +453,11 @@ def unstoppable_passed_pawn_score(bb: np.ndarray, phase: int, turn: int) -> int:
                 if king_dist > pawn_dist:
                     score += UNSTOPPABLE_PASSER_BONUS * endgame_weight // PHASE_MAX
 
-    if not (bb[WHITE * 6 + ROOK] or bb[WHITE * 6 + QUEEN]):
+    white_has_blocker = (
+        bb[WHITE * 6 + ROOK] or bb[WHITE * 6 + QUEEN]
+        or bb[WHITE * 6 + BISHOP] or bb[WHITE * 6 + KNIGHT]
+    )
+    if not white_has_blocker:
         wk = king_square(bb, WHITE)
         remaining = black_pawns
         while remaining:
