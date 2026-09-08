@@ -220,6 +220,17 @@ KING_ZONE_ATTACK_WEIGHT = np.array([2, 20, 20, 30, 45, 0], dtype=np.int32)
 # hit on the ring, capped at the last entry. 0-1 attackers round the raw per-square danger down to
 # nothing; each additional attacker climbs toward the raw (100%) danger.
 KING_ATTACK_COUNT_PERCENT = np.array([0, 20, 55, 78, 90, 96, 99, 100, 100], dtype=np.int32)
+# docs/fix.md F2: a non-pawn attacker with nothing of its own side defending it is a real but
+# temporary threat -- the defender can often just remove it -- not the sustained, coordinated
+# pressure KING_ATTACK_COUNT_PERCENT's superlinear scaling is meant to price. Confirmed by direct
+# construction: an identical attack pattern into the zone scored identically whether the attacker
+# was defended or not (a lone queen backed by a rook vs. the same lone queen with no defender at
+# all), and a queen sitting one king-move away from the enemy king with no defender at all -- where
+# the king could simply capture it next move -- still priced a full 147cp of danger. Halving an
+# undefended attacker's contribution and excluding it from attacker_count (so it alone cannot
+# trigger the count-table's steep 20%->55%->78% climb) fixes both without touching how a genuinely
+# supported attack is priced -- see king_safety_score below.
+UNSUPPORTED_ATTACKER_DISCOUNT_PERCENT = np.int32(50)
 # docs/fix.md Part 3b: an open or semi-open file next to the king is dangerous on its own -- an
 # enemy rook or queen can swing onto it regardless of how many pieces currently hit the king's own
 # ring -- so this is added on top of KING_ZONE_ATTACK_WEIGHT's ring pressure below rather than
@@ -801,6 +812,12 @@ def king_safety_score(bb: np.ndarray, phase: int) -> int:
     currently touching the zone (the classic "nothing attacking yet, but the rook will get there"
     case), so it should not be zeroed out by an attacker_count of 0 or 1 the way ring pressure
     correctly is.
+
+    A non-pawn attacker that is not itself defended (attacked_by, the same reverse-attack check
+    threats_score already uses for its own hanging-piece test -- see
+    UNSUPPORTED_ATTACKER_DISCOUNT_PERCENT above) has its contribution halved and does not count
+    toward attacker_count, since it is disposable pressure rather than the sustained kind the count
+    table is meant to reward.
     """
     if phase == 0:
         return 0
@@ -840,9 +857,15 @@ def king_safety_score(bb: np.ndarray, phase: int) -> int:
                 else:
                     atk = queen_attacks(sq, all_occ)
                 hits = _popcount64(atk & zone)
-                danger += KING_ZONE_ATTACK_WEIGHT[pt] * np.int32(hits)
                 if hits:
-                    attacker_count += 1
+                    contribution = KING_ZONE_ATTACK_WEIGHT[pt] * np.int32(hits)
+                    if attacked_by(bb, all_occ, color, sq):
+                        attacker_count += 1
+                    else:
+                        contribution = (
+                            contribution * UNSUPPORTED_ATTACKER_DISCOUNT_PERCENT // np.int32(100)
+                        )
+                    danger += contribution
 
         percent = KING_ATTACK_COUNT_PERCENT[min(attacker_count, count_cap)]
         danger = danger * percent // np.int32(100)
