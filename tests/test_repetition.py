@@ -53,6 +53,7 @@ def call_negamax(hist_len: int, ply: int = 0) -> int:
         killer_from, killer_to, killer_promo, history_table, cont_hist, True,
         sr.MAX_CHECK_EXTENSIONS,
         counter_from, counter_to, counter_promo, -1, -1, 0, -1, -1,
+        sr.SE_STACK_BUDGET,
     )
 
 

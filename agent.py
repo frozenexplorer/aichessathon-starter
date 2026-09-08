@@ -299,6 +299,7 @@ def _search_restricted(
                 killer_from, killer_to, killer_promo, history_table, cont_hist, True,
                 sr.MAX_CHECK_EXTENSIONS,
                 counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                sr.SE_STACK_BUDGET,
             )
             if counters[1]:
                 break
@@ -366,6 +367,7 @@ def _warm_up() -> None:
         killer_from, killer_to, killer_promo, history_table, cont_hist, True,
         sr.MAX_CHECK_EXTENSIONS,
         counter_from, counter_to, counter_promo, f0, t0, 0, -1, -1,
+        sr.SE_STACK_BUDGET,
     )
     tb.best_moves("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1")
 

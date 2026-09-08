@@ -35,6 +35,7 @@ def call_negamax(halfmove_clock: int) -> int:
         killer_from, killer_to, killer_promo, history_table, cont_hist, True,
         sr.MAX_CHECK_EXTENSIONS,
         counter_from, counter_to, counter_promo, -1, -1, halfmove_clock, -1, -1,
+        sr.SE_STACK_BUDGET,
     )
 
 

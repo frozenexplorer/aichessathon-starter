@@ -39,6 +39,7 @@ def run_negamax(excluded_from: int, excluded_to: int, depth: int = 4) -> tuple[i
         killer_from, killer_to, killer_promo, history_table, cont_hist, True,
         sr.MAX_CHECK_EXTENSIONS,
         counter_from, counter_to, counter_promo, -1, -1, 0, excluded_from, excluded_to,
+        sr.SE_STACK_BUDGET,
     )
     return score, tt_key
 
@@ -89,6 +90,7 @@ def main() -> None:
         killer_from, killer_to, killer_promo, history_table, cont_hist, True,
         sr.MAX_CHECK_EXTENSIONS,
         counter_from, counter_to, counter_promo, -1, -1, 0, 4, 3,
+        sr.SE_STACK_BUDGET,
     )
     root_slot_written = tt_key[slot_a] == h or tt_key[slot_b] == h
     print(f"excluded-move search wrote its OWN position's TT slot: {root_slot_written}")

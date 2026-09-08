@@ -406,6 +406,20 @@ SE_MIN_DEPTH = 7
 SE_TT_DEPTH_MARGIN = 3
 SE_MARGIN_PER_DEPTH = 2
 
+# Singular-extension stacking cap: se_budget, threaded through negamax exactly like ext_budget
+# (decremented once per grant, independently inherited by each recursive call so one branch's
+# spend never affects a sibling's), but its own counter, deliberately not sharing ext_budget's --
+# measured on a real game position (docs/fix.md's R50 move-16 investigation) where reusing
+# ext_budget never actually capped anything (that shared budget seeds at MAX_CHECK_EXTENSIONS and
+# check extensions rarely spend enough of it to bind), while the singular-extension grant alone
+# was still responsible for an 11-to-12x node/time explosion one ply deeper. A swept range of
+# dedicated values on that same position showed the explosion is gone by budget 2 and fully so at
+# budget 1, which also happened to still find the tactic (a hanging-rook capture) that a larger or
+# unbounded budget buried under the exploded subtree -- 1 is deliberately the smallest value that
+# cleared that case, not a guess; see fix.md for the sweep. Left independent of MAX_CHECK_EXTENSIONS
+# so this can be retuned without touching check-extension behaviour at all.
+SE_STACK_BUDGET = i64(1)
+
 # Fifty-move rule: 100 plies (50 full moves by each side) with no pawn move and no capture is an
 # automatic draw. See this module's docstring for where the running count comes from and why.
 HALFMOVE_DRAW_LIMIT = 100
@@ -480,6 +494,7 @@ _NEGAMAX_SIG = _I64(
     _B1, _I64,
     _I8_1D, _I8_1D, _I8_1D,
     _I64, _I64, _I64, _I64, _I64,
+    _I64,
 )
 
 _SEARCH_ROOT_RET = nbtypes.Tuple((_I64, _I64, _I64, _I64, _B1))  # type: ignore[no-untyped-call]
@@ -954,6 +969,7 @@ def negamax(
     halfmove_clock: int,
     excluded_from: int,
     excluded_to: int,
+    se_budget: int,
 ) -> int:
     counters[0] += 1
     if _time_up(deadline, counters):
@@ -1079,6 +1095,7 @@ def negamax(
             tt_key, tt_depth, tt_score, tt_flag, tt_from, tt_to, tt_promo,
             killer_from, killer_to, killer_promo, history_table, cont_hist, False, ext_budget,
             counter_from, counter_to, counter_promo, -1, -1, halfmove_clock + 1, -1, -1,
+            se_budget,
         )
         if counters[1]:
             return 0
@@ -1097,6 +1114,7 @@ def negamax(
             killer_from, killer_to, killer_promo, history_table, cont_hist, allow_null, ext_budget,
             counter_from, counter_to, counter_promo, parent_from, parent_to, halfmove_clock,
             -1, -1,
+            se_budget,
         )
         if counters[1]:
             return 0
@@ -1132,6 +1150,7 @@ def negamax(
             killer_from, killer_to, killer_promo, history_table, cont_hist, False, ext_budget,
             counter_from, counter_to, counter_promo, parent_from, parent_to, halfmove_clock,
             hint_from, hint_to,
+            se_budget,
         )
         if counters[1]:
             return 0
@@ -1212,8 +1231,16 @@ def negamax(
             else:
                 child_depth = depth - 1
                 child_ext_budget = ext_budget
-            if singular_extension and child_depth == depth - 1 and f == hint_from and t == hint_to:
+            child_se_budget = se_budget
+            if (
+                singular_extension
+                and child_depth == depth - 1
+                and f == hint_from
+                and t == hint_to
+                and se_budget > 0
+            ):
                 child_depth = depth
+                child_se_budget = se_budget - 1
             score = -negamax(
                 new_bb, new_meta, child_depth, -beta, -alpha, deadline, counters,
                 ply + 1, history, child_hist_len,
@@ -1221,6 +1248,7 @@ def negamax(
                 killer_from, killer_to, killer_promo, history_table, cont_hist, True,
                 child_ext_budget,
                 counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                child_se_budget,
             )
         else:
             # Phase 2.6 of docs/plan.md: futility and LMP both used to run only after make_move (a
@@ -1298,6 +1326,7 @@ def negamax(
                 killer_from, killer_to, killer_promo, history_table, cont_hist, True,
                 child_ext_budget,
                 counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                se_budget,
             )
             if not counters[1] and reduction > 0 and score > alpha:
                 # the reduced-depth probe suggested this late, quiet move might actually be
@@ -1310,6 +1339,7 @@ def negamax(
                     killer_from, killer_to, killer_promo, history_table, cont_hist, True,
                     child_ext_budget,
                     counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                    se_budget,
                 )
             if not counters[1] and alpha < score < beta:
                 score = -negamax(
@@ -1319,6 +1349,7 @@ def negamax(
                     killer_from, killer_to, killer_promo, history_table, cont_hist, True,
                     child_ext_budget,
                     counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                    se_budget,
                 )
         if counters[1]:
             return 0
@@ -1530,6 +1561,7 @@ def _search_root_pass(
                 killer_from, killer_to, killer_promo, history_table, cont_hist, True,
                 child_ext_budget,
                 counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                SE_STACK_BUDGET,
             )
         else:
             score = -negamax(
@@ -1538,6 +1570,7 @@ def _search_root_pass(
                 killer_from, killer_to, killer_promo, history_table, cont_hist, True,
                 child_ext_budget,
                 counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                SE_STACK_BUDGET,
             )
             if not counters[1] and alpha < score < beta:
                 score = -negamax(
@@ -1546,6 +1579,7 @@ def _search_root_pass(
                     killer_from, killer_to, killer_promo, history_table, cont_hist, True,
                     child_ext_budget,
                     counter_from, counter_to, counter_promo, f, t, child_halfmove_clock, -1, -1,
+                    SE_STACK_BUDGET,
                 )
         if counters[1]:
             return best_from, best_to, best_promo, best_score, False
